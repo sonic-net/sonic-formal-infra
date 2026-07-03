@@ -79,30 +79,57 @@ class BgpLsLinkNlri:
 
 
 @dataclass
-class LinkStateEdge:
-    """Link-state edge: Represents a unidirectional link between two nodes in
-    the topology, typically tracked in the TED; operational status field not
-    represented for now."""
-
-    asn: uint32_t
-    source: opaque_addr_t
-    destination: opaque_addr_t
-
-
-@dataclass
 class LinkStateNodeId:
     """Link-state node identifier: ISO system ID + IS-IS level.
 
-    Note that this is IS-IS specific. In case we test OSPF in case we test OSPF
-    in the future, we'll need to be flexible towards other node IDs."""
+    Note that this is IS-IS specific. In case we test OSPF in the future, we'll
+    need to be flexible towards other node IDs.
+
+    For reference:
+    .. code-block:: c
+      enum ls_origin { UNKNOWN = 0, ISIS_L1, ISIS_L2, OSPFv2, DIRECT, STATIC };
+
+      struct ls_node_id {
+        enum ls_origin origin;  /* Origin of the LS information */
+        union {
+          struct {
+            struct in_addr addr;    /* OSPF Router IS */
+            struct in_addr area_id; /* OSPF Area ID */
+          } ip;
+          struct {
+            uint8_t sys_id[ISO_SYS_ID_LEN]; /* ISIS System ID */
+            uint8_t level;                  /* ISIS Level */
+            uint8_t padding;
+            } iso;
+          } id;
+        };
+      };
+    """
 
     iso_sys_id: list[uint8_t]  # 6-byte ID
     level: uint8_t
 
 
 @dataclass
+class LinkStateEdge:
+    """Link-state edge: Represents a unidirectional link between two nodes in
+    the topology, typically tracked in the TED; operational status field not
+    represented for now."""
+
+    asn: uint32_t
+    source_node: LinkStateNodeId
+    dest_node: LinkStateNodeId
+    source: opaque_addr_t
+    destination: opaque_addr_t
+
+
+@dataclass
 class LinkStateAttributes:
-    """Link-state attributes: payload carried by zebra."""
+    """Link-state attributes: payload carried by zebra.
+
+    For reference: see
+    https://github.com/FRRouting/frr/blob/master/lib/link_state.h#L190C1-L258C3
+    """
 
     valid: bool
     adv: LinkStateNodeId  # advertising router
@@ -143,10 +170,25 @@ class BEvent(IntEnum):
 @dataclass
 class BApiLinkStateUpdate:
     """Input payload: zebra's link-state message notification. Type info
-    omitted; implied to be link in this API."""
+    omitted; implied to be link in this API.
+
+    For reference:
+    .. code-block:: c
+      struct ls_message {
+        uint8_t event;		/* Message Event: Sync, Add, Update, Delete */
+        uint8_t type;		/* Message Data Type: Node, Attribute, Prefix */
+        struct ls_node_id remote_id;	/* Remote Link State Node ID */
+
+        union {
+          struct ls_node *node;         /* Link State Node */
+          struct ls_attributes *attr;   /* Link State Attributes */
+          struct ls_prefix *prefix;     /* Link State Prefix */
+        } data;
+      };
+    """
 
     event: BEvent
-    remote: opaque_addr_t
+    remote: LinkStateNodeId  # this field is only used if using the attr field
     data: LinkStateAttributes
 
 
@@ -190,7 +232,7 @@ class BgpLsLinkState:
     asn: uint32_t = uint32_t(1)  # arbitrary ASN for now
     ted: list[LinkStateEdge] = field(default_factory=list)
     rib: list[BgpRibEntry] = field(default_factory=list)
-    next_id: opaque_prefix_t = opaque_prefix_t(0)
+    next_id: opaque_prefix_t = opaque_prefix_t(0)  # TODO check hash logic
 
     # ── Invariant ────────────────────────────────────────────────────────────
     def invariant(self) -> bool:
@@ -221,6 +263,11 @@ class BgpLsLinkState:
             for r in self.rib
         )
         nlri_link_nonnull = all(r.ls_nlri.link is not None for r in self.rib)
+        nlri_nodes_link_agree = all(
+            r.ls_nlri.source.igp_router_id == r.ls_nlri.link.interface
+            and r.ls_nlri.destination.igp_router_id == r.ls_nlri.link.neighbor
+            for r in self.rib
+        )
 
         # ── LSDB/TED ─────────────────────────────────────────────────────────
         ted_is_referenced = all(
@@ -238,6 +285,7 @@ class BgpLsLinkState:
             and nlri_nonnull
             and nlri_nodes_nonnull
             and nlri_link_nonnull
+            and nlri_nodes_link_agree
             and ted_is_referenced
         )
 
@@ -258,29 +306,42 @@ class BgpLsLinkState:
         # find and link reverse edge only if known event
         if (
             api.event != BEvent.SYNC
-            or api.event != BEvent.ADD
-            or api.event != BEvent.UPDATE
+            and api.event != BEvent.ADD
+            and api.event != BEvent.UPDATE
         ):
             return -1
 
         # two-way connectivity check - in the FRR implementation, both forward
         # and reverse direction are checked
         edge = self._find_edge(api.data.local, api.data.remote)
-        reverse = self._find_edge(api.data.remote, api.data.local)
 
         if not edge:
             self.ted.append(
-                LinkStateEdge(self.asn, api.data.local, api.data.remote)
+                LinkStateEdge(
+                    self.asn,
+                    api.data.adv,
+                    api.remote,
+                    api.data.local,
+                    api.data.remote,
+                )
             )
+
+        reverse = self._find_edge(api.data.remote, api.data.local)
 
         if not reverse:
             self.ted.append(
-                LinkStateEdge(self.asn, api.data.remote, api.data.local)
+                LinkStateEdge(
+                    self.asn,
+                    api.remote,
+                    api.data.adv,
+                    api.data.remote,
+                    api.data.local,
+                )
             )
 
-        # validate router ID lengths
-        if not self._valid_addr_length(api.data.local, api.data.remote):
-            return -1
+        # check if existing entry exists before updating
+        if self._nlri_exists(api.data.local, api.data.remote):
+            return 0
 
         # build link NLRI
         source: BgpLsNode = BgpLsNode(self.asn, api.data.local)
@@ -311,12 +372,16 @@ class BgpLsLinkState:
                 return e
         return None
 
-    def _valid_addr_length(
-        self, local: opaque_addr_t, remote: opaque_addr_t
-    ) -> bool:
-        """True iff `local` and `remote` can both be represented as an IPv6
-        address."""
-        return local.bit_length() <= 128 and remote.bit_length() <= 128
+    def _nlri_exists(self, local: opaque_addr_t, remote: opaque_addr_t) -> bool:
+        for entry in self.rib:
+            if (
+                entry.ls_nlri.source.igp_router_id == local
+                and entry.ls_nlri.destination.igp_router_id == remote
+                and entry.ls_nlri.link.interface == local
+                and entry.ls_nlri.link.neighbor == remote
+            ):
+                return True
+        return False
 
     def _allocate_new_id(self) -> opaque_prefix_t:
         """Allocates a new hash ID (corresponding to the synthetic prefix) for
