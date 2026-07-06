@@ -22,6 +22,9 @@ def _dedup_ted_seed(
     out: list[tuple[int, list[int], list[int], int, int]] = []
 
     for edge in ted_seed:
+        if edge[1] == edge[2] or edge[3] == edge[4]:
+            # remove loopbacks
+            continue
         if any(edge == entry for entry in out):
             continue
         out.append(edge)
@@ -30,6 +33,7 @@ def _dedup_ted_seed(
 
 def _build_state_and_api(
     ted_seed: list[tuple[int, list[int], list[int], int, int]],
+    api_asn: int,
     api_metric: int,
     api_src_sys_id: list[int],
     api_dest_sys_id: list[int],
@@ -42,6 +46,7 @@ def _build_state_and_api(
     """
 
     state = BgpLsLinkState(
+        asn=uint32_t(api_asn),
         ted=[
             LinkStateEdge(
                 uint32_t(asn),
@@ -55,7 +60,7 @@ def _build_state_and_api(
                 opaque_addr_t(remote),
             )
             for asn, src_sys_id, dest_sys_id, local, remote in ted_seed
-        ]
+        ],
     )
 
     src_node = LinkStateNodeId(
@@ -81,6 +86,7 @@ def _build_state_and_api(
 
 def api_bgp_ls_edge_update_with_precondition(
     ted_seed: list[tuple[int, list[int], list[int], int, int]],
+    api_asn: int,
     api_metric: int,
     api_src_sys_id: list[int],
     api_dest_sys_id: list[int],
@@ -100,6 +106,7 @@ def api_bgp_ls_edge_update_with_precondition(
     ted_seed = _dedup_ted_seed(ted_seed)
     state, api = _build_state_and_api(
         ted_seed,
+        api_asn,
         api_metric,
         api_src_sys_id,
         api_dest_sys_id,

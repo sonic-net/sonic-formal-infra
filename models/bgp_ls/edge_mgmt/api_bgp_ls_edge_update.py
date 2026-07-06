@@ -45,7 +45,7 @@ class BgpLsNode:
     """Node descriptor: identifies a router/node in the topology."""
 
     asn: uint32_t
-    igp_router_id: opaque_addr_t
+    igp_router_id: list[uint8_t]
 
 
 @dataclass
@@ -254,6 +254,7 @@ class BgpLsLinkState:
 
         # ── Uniqueness ───────────────────────────────────────────────────────
         ted_unique = no_dup(edge for edge in self.ted)
+        ted_nonloop = all(edge.source != edge.destination for edge in self.ted)
         rib_keys_unique = no_dup(r.synth_prefix for r in self.rib)
 
         # ── Format ───────────────────────────────────────────────────────────
@@ -263,17 +264,17 @@ class BgpLsLinkState:
             for r in self.rib
         )
         nlri_link_nonnull = all(r.ls_nlri.link is not None for r in self.rib)
-        nlri_nodes_link_agree = all(
-            r.ls_nlri.source.igp_router_id == r.ls_nlri.link.interface
-            and r.ls_nlri.destination.igp_router_id == r.ls_nlri.link.neighbor
+        nlri_nonloop = all(
+            r.ls_nlri.source.igp_router_id
+            != r.ls_nlri.destination.igp_router_id
             for r in self.rib
         )
 
         # ── LSDB/TED ─────────────────────────────────────────────────────────
         ted_is_referenced = all(
             any(
-                r.ls_nlri.source.igp_router_id == edge.source
-                and r.ls_nlri.destination.igp_router_id == edge.destination
+                r.ls_nlri.link.interface == edge.source
+                and r.ls_nlri.link.neighbor == edge.destination
                 for edge in self.ted
             )
             for r in self.rib
@@ -281,11 +282,12 @@ class BgpLsLinkState:
 
         return (
             ted_unique
+            and ted_nonloop
             and rib_keys_unique
             and nlri_nonnull
             and nlri_nodes_nonnull
             and nlri_link_nonnull
-            and nlri_nodes_link_agree
+            and nlri_nonloop
             and ted_is_referenced
         )
 
@@ -310,6 +312,10 @@ class BgpLsLinkState:
             and api.event != BEvent.UPDATE
         ):
             return -1
+
+        if api.data.adv == api.remote or api.data.local == api.data.remote:
+            # disallow loopbacks to be appended as NLRI
+            return 0
 
         # two-way connectivity check - in the FRR implementation, both forward
         # and reverse direction are checked
@@ -340,12 +346,17 @@ class BgpLsLinkState:
             )
 
         # check if existing entry exists before updating
-        if self._nlri_exists(api.data.local, api.data.remote):
+        if self._nlri_exists(
+            api.data.adv.iso_sys_id,
+            api.remote.iso_sys_id,
+            api.data.local,
+            api.data.remote,
+        ):
             return 0
 
         # build link NLRI
-        source: BgpLsNode = BgpLsNode(self.asn, api.data.local)
-        destination: BgpLsNode = BgpLsNode(self.asn, api.data.remote)
+        source: BgpLsNode = BgpLsNode(self.asn, api.data.adv.iso_sys_id)
+        destination: BgpLsNode = BgpLsNode(self.asn, api.remote.iso_sys_id)
         link: BgpLsLink = BgpLsLink(
             interface=api.data.local,
             neighbor=api.data.remote,
@@ -372,11 +383,17 @@ class BgpLsLinkState:
                 return e
         return None
 
-    def _nlri_exists(self, local: opaque_addr_t, remote: opaque_addr_t) -> bool:
+    def _nlri_exists(
+        self,
+        local_sys_id: list[uint8_t],
+        remote_sys_id: list[uint8_t],
+        local: opaque_addr_t,
+        remote: opaque_addr_t,
+    ) -> bool:
         for entry in self.rib:
             if (
-                entry.ls_nlri.source.igp_router_id == local
-                and entry.ls_nlri.destination.igp_router_id == remote
+                entry.ls_nlri.source.igp_router_id == local_sys_id
+                and entry.ls_nlri.destination.igp_router_id == remote_sys_id
                 and entry.ls_nlri.link.interface == local
                 and entry.ls_nlri.link.neighbor == remote
             ):
