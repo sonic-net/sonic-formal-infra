@@ -1,6 +1,6 @@
 """Format script for CrossHair arg_dictionary test inputs.
 
-Reads tests/nh_update_argdict.txt (or any arg_dictionary-format file from
+Reads tests/edge_update_argdict.txt (or any arg_dictionary-format file from
 `crosshair cover`), canonicalizes and dedupes inputs, re-executes the
 model on each canonical input, and writes a JSON file of fully-populated
 test cases that can compare against actual bgpd execution.
@@ -15,7 +15,7 @@ import json
 import os
 import sys
 from dataclasses import dataclass
-from typing import Iterator
+from collections.abc import Iterator
 
 _HERE = os.path.dirname(
     os.path.abspath(__file__)
@@ -30,45 +30,25 @@ sys.path.insert(0, os.path.join(_ROOT, "models"))
 
 print(f"_ROOT: {_ROOT}")
 
-from mbt.modeling_primitives import clamp_u32, to_ipv6_opaque_address, uint8_t  # noqa: E402
-from bgp_ls.edge_mgmt.api_bgp_ls_edge_update import (  # noqa: E402
+from mbt.modeling_primitives import clamp_u32, to_ipv6_opaque_address
+from bgp_ls.edge_mgmt.api_bgp_ls_edge_update import (
     BApiLinkStateUpdate,
     BgpLsLinkState,
 )
+from bgp_ls.edge_mgmt.igp_primitives import to_sys_id
 
 # Reaching for the underscore-prefixed helpers from crosshair_target.
 # They're the canonical "normalize + build" trio; reusing them here keeps
 # the postprocessor exactly in sync with the symbolic entry point.
-from bgp_ls.edge_mgmt.crosshair_target import (  # noqa: E402
-    _dedup_ted_seed,
+from bgp_ls.edge_mgmt.crosshair_target import (
+    _correct_api_params,
+    _correct_ted_seed,
     _build_state_and_api,
 )
 
 
 DEFAULT_INPUT = os.path.join(_HERE, "tests", "edge_update_argdict.txt")
 DEFAULT_OUTPUT = os.path.join(_HERE, "tests", "edge_update_formatted.json")
-
-
-OPAQUE_SYS_ID = [0, 0, 0, 0, 0, 0]
-BROAD_SYS_ID = [255, 255, 255, 255, 255, 255]
-NUM_BYTES_SYS_ID = 6
-
-
-def to_iso_sys_id(a: list[uint8_t]) -> str:
-    """Deterministic ISO System ID for a six-byte list of uint8_t. Keeps 4
-    hextets (64 bits) of entropy and zeroes the other 4.
-    Suitable for nexthop / endpoint / resolved fields.
-    OPAQUE_ROOT (id 0) maps to '::', the IPv6 unspecified address."""
-    if len(a) < NUM_BYTES_SYS_ID or a == OPAQUE_SYS_ID:
-        return "0000.0000.0000"
-    if a == BROAD_SYS_ID:
-        return "FFFF.FFFF.FFFF"
-    h = ""
-    for i in range(NUM_BYTES_SYS_ID):
-        if i % 2 == 0 and i > 0:
-            h += "."
-        h += f"{a[i]:02X}"
-    return h
 
 
 @dataclass
@@ -109,31 +89,45 @@ def canonicalize(inputs: dict) -> dict:
 
     After this pass, two raw inputs that map to the same model behavior
     become byte-identical, which lets us dedupe."""
-    ted_seed = _dedup_ted_seed(inputs["ted_seed"])
+
+    api_src_sys_id, api_dest_sys_id, api_local, api_remote = (
+        _correct_api_params(
+            inputs["api_src_sys_id"],
+            inputs["api_dest_sys_id"],
+            inputs["api_local"],
+            inputs["api_remote"],
+        )
+    )
+    ted_seed = _correct_ted_seed(
+        inputs["ted_seed"],
+        api_src_sys_id,
+        api_dest_sys_id,
+        api_local,
+        api_remote,
+    )
     return {
         "ted_seed": ted_seed,
         "api_asn": inputs["api_asn"],
         "api_metric": inputs["api_metric"],
-        "api_src_sys_id": inputs["api_src_sys_id"],
-        "api_dest_sys_id": inputs["api_dest_sys_id"],
+        "api_src_sys_id": api_src_sys_id,
+        "api_dest_sys_id": api_dest_sys_id,
         "api_level": inputs["api_level"],
-        "api_local": inputs["api_local"],
-        "api_remote": inputs["api_remote"],
+        "api_local": api_local,
+        "api_remote": api_remote,
     }
 
 
 def _hash_key(canonical: dict) -> tuple:
     """Hashable fingerprint of canonical inputs (lists become tuples)."""
     return (
-        # list[tuple[int, list[int], list[int], int, int]]
         tuple(
-            (asn, tuple(src_sys_id), tuple(dest_sys_id), src, dest)
+            (asn, src_sys_id, dest_sys_id, src, dest)
             for asn, src_sys_id, dest_sys_id, src, dest in canonical["ted_seed"]
         ),
         canonical["api_asn"],
         canonical["api_metric"],
-        tuple(canonical["api_src_sys_id"]),
-        tuple(canonical["api_dest_sys_id"]),
+        canonical["api_src_sys_id"],
+        canonical["api_dest_sys_id"],
         canonical["api_level"],
         canonical["api_local"],
         canonical["api_remote"],
@@ -191,11 +185,11 @@ def _state_to_dict(s: BgpLsLinkState) -> dict:
                 "source": to_ipv6_opaque_address(e.source),
                 "destination": to_ipv6_opaque_address(e.destination),
                 "source_node": {
-                    "iso_sys_id": to_iso_sys_id(e.source_node.iso_sys_id),
+                    "iso_sys_id": to_sys_id(e.source_node.iso_sys_id),
                     "level": e.source_node.level,
                 },
                 "destination_node": {
-                    "iso_sys_id": to_iso_sys_id(e.dest_node.iso_sys_id),
+                    "iso_sys_id": to_sys_id(e.dest_node.iso_sys_id),
                     "level": e.dest_node.level,
                 },
             }
@@ -205,13 +199,11 @@ def _state_to_dict(s: BgpLsLinkState) -> dict:
             {
                 "source": {
                     "asn": clamp_u32(e.ls_nlri.source.asn),
-                    "igp_router_id": to_iso_sys_id(
-                        e.ls_nlri.source.igp_router_id
-                    ),
+                    "igp_router_id": to_sys_id(e.ls_nlri.source.igp_router_id),
                 },
                 "destination": {
                     "asn": clamp_u32(e.ls_nlri.destination.asn),
-                    "igp_router_id": to_iso_sys_id(
+                    "igp_router_id": to_sys_id(
                         e.ls_nlri.destination.igp_router_id
                     ),
                 },
@@ -232,12 +224,12 @@ def _api_to_dict(a: BApiLinkStateUpdate) -> dict:
     return {
         "event": a.event,
         "remote": {
-            "iso_sys_id": to_iso_sys_id(a.remote.iso_sys_id),
+            "iso_sys_id": to_sys_id(a.remote.iso_sys_id),
             "level": a.remote.level,
         },
         "data": {
             "adv": {
-                "iso_sys_id": to_iso_sys_id(a.data.adv.iso_sys_id),
+                "iso_sys_id": to_sys_id(a.data.adv.iso_sys_id),
                 "level": a.data.adv.level,
             },
             "name": a.data.name if a.data.name else "",
@@ -261,7 +253,7 @@ def format_test_case(tc: TestCase) -> dict:
     tc.response = res
     return {
         "TestId": tc.test_id,
-        "Op": "api_bgp_nh_update",
+        "Op": "api_bgp_ls_edge_update",
         "InitialState": _state_to_dict(initial_state),
         "ApiParam": _api_to_dict(api),
         "FinalState": _state_to_dict(final_state),

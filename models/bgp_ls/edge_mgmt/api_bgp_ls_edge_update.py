@@ -20,9 +20,9 @@ out of scope.
 
 """
 
+from bgp_ls.edge_mgmt.igp_primitives import sys_id_t
 from dataclasses import dataclass, field
 from enum import IntEnum
-
 from modeling_primitives import (
     no_dup,
     opaque_addr_t,
@@ -30,6 +30,7 @@ from modeling_primitives import (
     uint8_t,
     uint32_t,
 )
+
 
 # ── Domain types ─────────────────────────────────────────────────────────────
 # Abstract types that capture key fields relevant to bgpd's handling of link
@@ -45,7 +46,7 @@ class BgpLsNode:
     """Node descriptor: identifies a router/node in the topology."""
 
     asn: uint32_t
-    igp_router_id: list[uint8_t]
+    igp_router_id: sys_id_t
 
 
 @dataclass
@@ -78,7 +79,7 @@ class BgpLsLinkNlri:
 # IS-IS and OSPF.
 
 
-@dataclass
+@dataclass(frozen=True)
 class LinkStateNodeId:
     """Link-state node identifier: ISO system ID + IS-IS level.
 
@@ -106,7 +107,7 @@ class LinkStateNodeId:
       };
     """
 
-    iso_sys_id: list[uint8_t]  # 6-byte ID
+    iso_sys_id: sys_id_t
     level: uint8_t
 
 
@@ -229,10 +230,12 @@ class BgpLsLinkState:
     Tracks the RIB and BGP-LS TED.
     """
 
-    asn: uint32_t = uint32_t(1)  # arbitrary ASN for now
+    asn: uint32_t = field(default=uint32_t(100))  # arbitrary ASN for now
     ted: list[LinkStateEdge] = field(default_factory=list)
     rib: list[BgpRibEntry] = field(default_factory=list)
-    next_id: opaque_prefix_t = opaque_prefix_t(0)  # TODO check hash logic
+    next_id: opaque_prefix_t = field(
+        default=opaque_prefix_t(0)
+    )  # TODO check hash logic
 
     # ── Invariant ────────────────────────────────────────────────────────────
     def invariant(self) -> bool:
@@ -255,6 +258,14 @@ class BgpLsLinkState:
         # ── Uniqueness ───────────────────────────────────────────────────────
         ted_unique = no_dup(edge for edge in self.ted)
         ted_nonloop = all(edge.source != edge.destination for edge in self.ted)
+        ted_one_sys_many_ip = self._sys_id_matches_ip(self.ted)
+        ted_nonzero_ids = all(
+            edge.source_node.iso_sys_id != 0
+            and edge.dest_node.iso_sys_id != 0
+            and edge.source != 0
+            and edge.destination != 0
+            for edge in self.ted
+        )
         rib_keys_unique = no_dup(r.synth_prefix for r in self.rib)
 
         # ── Format ───────────────────────────────────────────────────────────
@@ -283,6 +294,8 @@ class BgpLsLinkState:
         return (
             ted_unique
             and ted_nonloop
+            and ted_one_sys_many_ip
+            and ted_nonzero_ids
             and rib_keys_unique
             and nlri_nonnull
             and nlri_nodes_nonnull
@@ -385,8 +398,8 @@ class BgpLsLinkState:
 
     def _nlri_exists(
         self,
-        local_sys_id: list[uint8_t],
-        remote_sys_id: list[uint8_t],
+        local_sys_id: sys_id_t,
+        remote_sys_id: sys_id_t,
         local: opaque_addr_t,
         remote: opaque_addr_t,
     ) -> bool:
@@ -406,3 +419,25 @@ class BgpLsLinkState:
         prev: opaque_prefix_t = self.next_id
         self.next_id = opaque_prefix_t(self.next_id + 1)
         return prev
+
+    def _sys_id_matches_ip(self, edges: list[LinkStateEdge]) -> bool:
+        """Verifies a strict 1:N mapping between system IDs and IPs."""
+        sys_m = {}
+
+        for e in edges:
+            # fmt: off
+            pairs = (
+                (e.source_node, e.source,),
+                (e.dest_node, e.destination),
+            )
+            # fmt: on
+            for node, ip in pairs:
+                if any(
+                    sys_id != node and ip in ips
+                    for sys_id, ips in sys_m.items()
+                ):
+                    return False
+
+                sys_m.setdefault(node, set()).add(ip)
+
+        return True

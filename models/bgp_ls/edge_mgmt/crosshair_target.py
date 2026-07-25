@@ -13,30 +13,106 @@ from bgp_ls.edge_mgmt.api_bgp_ls_edge_update import (
     LinkStateEdge,
     LinkStateNodeId,
 )
+from bgp_ls.edge_mgmt.igp_primitives import sys_id_t
 
 
-def _dedup_ted_seed(
-    ted_seed: list[tuple[int, list[int], list[int], int, int]],
-) -> list[tuple[int, list[int], list[int], int, int]]:
+def _correct_api_params(
+    api_src_sys_id: int,
+    api_dest_sys_id: int,
+    api_local: int,
+    api_remote: int,
+) -> tuple[int, int, int, int]:
+    new_src_sys_id, new_dest_sys_id, new_local, new_remote = (
+        api_src_sys_id,
+        api_dest_sys_id,
+        api_local,
+        api_remote,
+    )
 
-    out: list[tuple[int, list[int], list[int], int, int]] = []
+    # ensure sys IDs and IPs are not unspecified
+    DEFAULT_ID = 1
+    ALT_ID = 9552
+
+    if new_src_sys_id == 0:
+        new_src_sys_id = DEFAULT_ID
+
+    if new_dest_sys_id == 0:
+        new_dest_sys_id = ALT_ID
+
+    if new_local == 0:
+        new_local = DEFAULT_ID
+
+    if new_remote == 0:
+        new_remote = ALT_ID
+
+    sign = lambda x: (x > 0) - (x < 0)
+
+    # ensure edge does not point back to the same node or through the same
+    # interface; we simply assign it to an adjacent hashable address
+    # note that we need to ensure the new number is not zero; to do this, we
+    # add the sign to move it away from zero
+    if new_src_sys_id == new_dest_sys_id:
+        new_dest_sys_id += sign(new_dest_sys_id)
+
+    if new_local == new_remote:
+        new_remote += sign(new_remote)
+
+    return new_src_sys_id, new_dest_sys_id, new_local, new_remote
+
+
+def _correct_ted_seed(
+    ted_seed: list[tuple[int, int, int, int, int]],
+    api_src_sys_id: int,
+    api_dest_sys_id: int,
+    api_local: int,
+    api_remote: int,
+) -> list[tuple[int, int, int, int, int]]:
+
+    out: list[tuple[int, int, int, int, int]] = []
+
+    sys_m = {api_src_sys_id: {api_local}, api_dest_sys_id: {api_remote}}
 
     for edge in ted_seed:
-        if edge[1] == edge[2] or edge[3] == edge[4]:
-            # remove loopbacks
+        # skip edges with unspecified addresses
+        if any(edge_id == 0 for edge_id in edge):
             continue
-        if any(edge == entry for entry in out):
+
+        _, src_sys_id, dest_sys_id, local, remote = edge
+
+        # skip mismatched edges, i.e. enforce one-to-many relationship
+        # between ISO sys IDs to IP addresses
+        pairs = ((src_sys_id, local), (dest_sys_id, remote))
+        if any(
+            sys_id != node and ip in ips
+            for sys_id, ips in sys_m.items()
+            for node, ip in pairs
+        ):
             continue
+
+        # skip edges back to the same node; doing this after mismatched edges
+        # should ensure that each IP address belongs to only one uniquely
+        # identifiable router
+        if src_sys_id == dest_sys_id or local == remote:
+            continue
+
+        # skip duplicates
+        if any(edge == e for e in out):
+            continue
+
+        # append the valid edge
+        sys_m.setdefault(src_sys_id, set()).add(local)
+        sys_m.setdefault(dest_sys_id, set()).add(remote)
         out.append(edge)
+
     return out
 
 
 def _build_state_and_api(
-    ted_seed: list[tuple[int, list[int], list[int], int, int]],
+    ted_seed: list[tuple[int, int, int, int, int]],
     api_asn: int,
     api_metric: int,
-    api_src_sys_id: list[int],
-    api_dest_sys_id: list[int],
+    api_src_sys_id: int,
+    api_dest_sys_id: int,
     api_level: int,
     api_local: int,
     api_remote: int,
@@ -50,12 +126,8 @@ def _build_state_and_api(
         ted=[
             LinkStateEdge(
                 uint32_t(asn),
-                LinkStateNodeId(
-                    [uint8_t(b) for b in src_sys_id], uint8_t(api_level)
-                ),
-                LinkStateNodeId(
-                    [uint8_t(b) for b in dest_sys_id], uint8_t(api_level)
-                ),
+                LinkStateNodeId(sys_id_t(src_sys_id), uint8_t(api_level)),
+                LinkStateNodeId(sys_id_t(dest_sys_id), uint8_t(api_level)),
                 opaque_addr_t(local),
                 opaque_addr_t(remote),
             )
@@ -63,9 +135,7 @@ def _build_state_and_api(
         ],
     )
 
-    src_node = LinkStateNodeId(
-        [uint8_t(b) for b in api_src_sys_id], uint8_t(api_level)
-    )
+    src_node = LinkStateNodeId(sys_id_t(api_src_sys_id), uint8_t(api_level))
 
     attr = LinkStateAttributes(
         valid=True,
@@ -76,34 +146,32 @@ def _build_state_and_api(
         remote=opaque_addr_t(api_remote),
     )
 
-    dest_node = LinkStateNodeId(
-        [uint8_t(b) for b in api_dest_sys_id], uint8_t(api_level)
-    )
+    dest_node = LinkStateNodeId(sys_id_t(api_dest_sys_id), uint8_t(api_level))
 
     api = BApiLinkStateUpdate(event=BEvent.UPDATE, remote=dest_node, data=attr)
     return state, api
 
 
 def api_bgp_ls_edge_update_with_precondition(
-    ted_seed: list[tuple[int, list[int], list[int], int, int]],
+    ted_seed: list[tuple[int, int, int, int, int]],
     api_asn: int,
     api_metric: int,
-    api_src_sys_id: list[int],
-    api_dest_sys_id: list[int],
+    api_src_sys_id: int,
+    api_dest_sys_id: int,
     api_level: int,
     api_local: int,
     api_remote: int,
 ) -> int:
-    assert len(api_src_sys_id) == 6
-    assert len(api_dest_sys_id) == 6
-    assert all(
-        len(src_sys_id) == 6 and len(dest_sys_id) == 6
-        for _, src_sys_id, dest_sys_id, _, _ in ted_seed
+    api_src_sys_id, api_dest_sys_id, api_local, api_remote = (
+        _correct_api_params(
+            api_src_sys_id, api_dest_sys_id, api_local, api_remote
+        )
     )
-    assert api_src_sys_id != api_dest_sys_id
-    assert api_local != api_remote
 
-    ted_seed = _dedup_ted_seed(ted_seed)
+    ted_seed = _correct_ted_seed(
+        ted_seed, api_src_sys_id, api_dest_sys_id, api_local, api_remote
+    )
+
     state, api = _build_state_and_api(
         ted_seed,
         api_asn,
