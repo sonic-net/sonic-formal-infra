@@ -5,23 +5,18 @@ The entry point for test generation is
 """
 
 from modeling_primitives import opaque_addr_t, uint8_t, uint32_t
-from bgp_ls.edge_mgmt.api_bgp_ls_edge_update import (
-    BEvent,
-    BgpLsLinkState,
-    BApiLinkStateUpdate,
-    LinkStateAttributes,
-    LinkStateEdge,
-    LinkStateNodeId,
-)
+from bgp_ls.linkstate_data import *
+from bgp_ls.edge_mgmt.api_bgp_ls_edge_update import BgpLsLinkState
 from bgp_ls.edge_mgmt.igp_primitives import sys_id_t
 
 
 def _correct_api_params(
+    api_event: int,
     api_src_sys_id: int,
     api_dest_sys_id: int,
     api_local: int,
     api_remote: int,
-) -> tuple[int, int, int, int]:
+) -> tuple[int, int, int, int, int]:
     new_src_sys_id, new_dest_sys_id, new_local, new_remote = (
         api_src_sys_id,
         api_dest_sys_id,
@@ -57,18 +52,18 @@ def _correct_api_params(
     if new_local == new_remote:
         new_remote += sign(new_remote)
 
-    return new_src_sys_id, new_dest_sys_id, new_local, new_remote
+    return api_event % 5, new_src_sys_id, new_dest_sys_id, new_local, new_remote
 
 
 def _correct_ted_seed(
-    ted_seed: list[tuple[int, int, int, int, int]],
+    ted_seed: list[tuple[int, int, int, int]],
     api_src_sys_id: int,
     api_dest_sys_id: int,
     api_local: int,
     api_remote: int,
-) -> list[tuple[int, int, int, int, int]]:
+) -> list[tuple[int, int, int, int]]:
 
-    out: list[tuple[int, int, int, int, int]] = []
+    out: list[tuple[int, int, int, int]] = []
 
     sys_m = {api_src_sys_id: {api_local}, api_dest_sys_id: {api_remote}}
 
@@ -77,15 +72,19 @@ def _correct_ted_seed(
         if any(edge_id == 0 for edge_id in edge):
             continue
 
-        _, src_sys_id, dest_sys_id, local, remote = edge
+        src_sys_id, dest_sys_id, local, remote = edge
+        edge_interfaces = ((src_sys_id, local), (dest_sys_id, remote))
+        api_interfaces = (
+            (api_src_sys_id, api_local),
+            (api_dest_sys_id, api_remote),
+        )
 
         # skip mismatched edges, i.e. enforce one-to-many relationship
         # between ISO sys IDs to IP addresses
-        pairs = ((src_sys_id, local), (dest_sys_id, remote))
         if any(
             sys_id != node and ip in ips
             for sys_id, ips in sys_m.items()
-            for node, ip in pairs
+            for node, ip in edge_interfaces
         ):
             continue
 
@@ -93,6 +92,19 @@ def _correct_ted_seed(
         # should ensure that each IP address belongs to only one uniquely
         # identifiable router
         if src_sys_id == dest_sys_id or local == remote:
+            continue
+
+        # skip edges with same node, same interface as parameters
+        # this ensures that we do not need to model edge deletions at the same
+        # time
+        if (
+            sum(
+                interface == api_interface
+                for interface in edge_interfaces
+                for api_interface in api_interfaces
+            )
+            == 1
+        ):
             continue
 
         # skip duplicates
@@ -104,13 +116,17 @@ def _correct_ted_seed(
         sys_m.setdefault(dest_sys_id, set()).add(remote)
         out.append(edge)
 
+        rev = (dest_sys_id, src_sys_id, remote, local)
+        if rev not in out:
+            out.append(rev)
+
     return out
 
 
 def _build_state_and_api(
-    ted_seed: list[tuple[int, int, int, int, int]],
+    ted_seed: list[tuple[int, int, int, int]],
+    api_event: int,
     api_asn: int,
-    api_metric: int,
     api_src_sys_id: int,
     api_dest_sys_id: int,
     api_level: int,
@@ -125,46 +141,58 @@ def _build_state_and_api(
         asn=uint32_t(api_asn),
         ted=[
             LinkStateEdge(
-                uint32_t(asn),
+                uint32_t(api_asn),
                 LinkStateNodeId(sys_id_t(src_sys_id), uint8_t(api_level)),
                 LinkStateNodeId(sys_id_t(dest_sys_id), uint8_t(api_level)),
                 opaque_addr_t(local),
                 opaque_addr_t(remote),
             )
-            for asn, src_sys_id, dest_sys_id, local, remote in ted_seed
+            for src_sys_id, dest_sys_id, local, remote in ted_seed
+        ],
+        rib=[
+            BgpLsLinkNlri(
+                BgpLsNode(uint32_t(api_asn), sys_id_t(src_sys_id)),
+                BgpLsNode(uint32_t(api_asn), sys_id_t(dest_sys_id)),
+                BgpLsLink(
+                    opaque_addr_t(local),
+                    opaque_addr_t(remote),
+                    uint32_t(api_asn),
+                ),
+            )
+            for src_sys_id, dest_sys_id, local, remote in ted_seed
         ],
     )
 
     src_node = LinkStateNodeId(sys_id_t(api_src_sys_id), uint8_t(api_level))
 
     attr = LinkStateAttributes(
-        valid=True,
         adv=src_node,
         name=None,
-        metric=uint32_t(api_metric),
         local=opaque_addr_t(api_local),
         remote=opaque_addr_t(api_remote),
     )
 
     dest_node = LinkStateNodeId(sys_id_t(api_dest_sys_id), uint8_t(api_level))
 
-    api = BApiLinkStateUpdate(event=BEvent.UPDATE, remote=dest_node, data=attr)
+    api = BApiLinkStateUpdate(
+        event=BEvent(api_event), remote=dest_node, data=attr
+    )
     return state, api
 
 
 def api_bgp_ls_edge_update_with_precondition(
-    ted_seed: list[tuple[int, int, int, int, int]],
+    ted_seed: list[tuple[int, int, int, int]],
+    api_event: int,
     api_asn: int,
-    api_metric: int,
     api_src_sys_id: int,
     api_dest_sys_id: int,
     api_level: int,
     api_local: int,
     api_remote: int,
-) -> int:
-    api_src_sys_id, api_dest_sys_id, api_local, api_remote = (
+) -> BgpAttributes | None:
+    api_event, api_src_sys_id, api_dest_sys_id, api_local, api_remote = (
         _correct_api_params(
-            api_src_sys_id, api_dest_sys_id, api_local, api_remote
+            api_event, api_src_sys_id, api_dest_sys_id, api_local, api_remote
         )
     )
 
@@ -174,8 +202,8 @@ def api_bgp_ls_edge_update_with_precondition(
 
     state, api = _build_state_and_api(
         ted_seed,
+        api_event,
         api_asn,
-        api_metric,
         api_src_sys_id,
         api_dest_sys_id,
         api_level,

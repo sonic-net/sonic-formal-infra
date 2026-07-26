@@ -20,204 +20,14 @@ out of scope.
 
 """
 
-from bgp_ls.edge_mgmt.igp_primitives import sys_id_t
+from bgp_ls.linkstate_data import *
 from dataclasses import dataclass, field
-from enum import IntEnum
 from modeling_primitives import (
+    clamp_u32,
     no_dup,
     opaque_addr_t,
-    opaque_prefix_t,
-    uint8_t,
     uint32_t,
 )
-
-
-# ── Domain types ─────────────────────────────────────────────────────────────
-# Abstract types that capture key fields relevant to bgpd's handling of link
-# state edge updates.
-
-
-# ── BGP-LS data structures ───────────────────────────────────────────────────
-# BGP-LS-specific types; adheres to RFC and implemented similarly within FRR.
-
-
-@dataclass
-class BgpLsNode:
-    """Node descriptor: identifies a router/node in the topology."""
-
-    asn: uint32_t
-    igp_router_id: sys_id_t
-
-
-@dataclass
-class BgpLsLink:
-    """Link descriptor: identifies a link between two nodes; does not include
-    IPv4 addresses. Note that the FRR's link descriptor also specifies
-    identifier fields for nodes that do not have IPv4 or IPv6 addresses
-    associated with their interfaces."""
-
-    interface: opaque_addr_t  # IPv6 address
-    neighbor: opaque_addr_t  # IPv6 address
-    remote_asn: uint32_t
-
-
-@dataclass
-class BgpLsLinkNlri:
-    """Link NLRI: Identifies a link between two nodes.
-
-    Compliant with RFC 9552, which requires that Link NLRI specifically specify
-    source and destination node descriptors as well as a link descriptor."""
-
-    source: BgpLsNode
-    destination: BgpLsNode
-    link: BgpLsLink
-
-
-# ── Link-state data structures ───────────────────────────────────────────────
-# FRR-specific Link-State implementation types. SONiC, running FRR as its
-# network stack, relies on these data types to generalize information from both
-# IS-IS and OSPF.
-
-
-@dataclass(frozen=True)
-class LinkStateNodeId:
-    """Link-state node identifier: ISO system ID + IS-IS level.
-
-    Note that this is IS-IS specific. In case we test OSPF in the future, we'll
-    need to be flexible towards other node IDs.
-
-    For reference:
-    .. code-block:: c
-      enum ls_origin { UNKNOWN = 0, ISIS_L1, ISIS_L2, OSPFv2, DIRECT, STATIC };
-
-      struct ls_node_id {
-        enum ls_origin origin;  /* Origin of the LS information */
-        union {
-          struct {
-            struct in_addr addr;    /* OSPF Router IS */
-            struct in_addr area_id; /* OSPF Area ID */
-          } ip;
-          struct {
-            uint8_t sys_id[ISO_SYS_ID_LEN]; /* ISIS System ID */
-            uint8_t level;                  /* ISIS Level */
-            uint8_t padding;
-            } iso;
-          } id;
-        };
-      };
-    """
-
-    iso_sys_id: sys_id_t
-    level: uint8_t
-
-
-@dataclass
-class LinkStateEdge:
-    """Link-state edge: Represents a unidirectional link between two nodes in
-    the topology, typically tracked in the TED; operational status field not
-    represented for now."""
-
-    asn: uint32_t
-    source_node: LinkStateNodeId
-    dest_node: LinkStateNodeId
-    source: opaque_addr_t
-    destination: opaque_addr_t
-
-
-@dataclass
-class LinkStateAttributes:
-    """Link-state attributes: payload carried by zebra.
-
-    For reference: see
-    https://github.com/FRRouting/frr/blob/master/lib/link_state.h#L190C1-L258C3
-    """
-
-    valid: bool
-    adv: LinkStateNodeId  # advertising router
-    name: str | None
-    metric: uint32_t
-    local: opaque_addr_t  # local IPv6 address
-    remote: opaque_addr_t  # remote IPv6 address
-
-
-@dataclass
-class BgpRibEntry:
-    """One entry in bgpd's RIB: a prefix, link topology, and the set of
-    nexthops that reach the originating BGP peer."""
-
-    synth_prefix: opaque_prefix_t
-    ls_nlri: BgpLsLinkNlri
-
-
-# ── API surface ──────────────────────────────────────────────────────────────
-# The action under test takes a BApiLinkStateUpdate (what zebra sends) and
-# returns 0 after successfully originating the link; -1 otherwise.
-
-
-# ── Zebra types ──────────────────────────────────────────────────────────────
-# Types used in the Zebra API, such as Opaque messages.
-
-
-class BEvent(IntEnum):
-    """Link-state event conveyed by zebra."""
-
-    UNDEF = 0
-    SYNC = 1
-    ADD = 2
-    UPDATE = 3
-    DELETE = 4
-
-
-@dataclass
-class BApiLinkStateUpdate:
-    """Input payload: zebra's link-state message notification. Type info
-    omitted; implied to be link in this API.
-
-    For reference:
-    .. code-block:: c
-      struct ls_message {
-        uint8_t event;		/* Message Event: Sync, Add, Update, Delete */
-        uint8_t type;		/* Message Data Type: Node, Attribute, Prefix */
-        struct ls_node_id remote_id;	/* Remote Link State Node ID */
-
-        union {
-          struct ls_node *node;         /* Link State Node */
-          struct ls_attributes *attr;   /* Link State Attributes */
-          struct ls_prefix *prefix;     /* Link State Prefix */
-        } data;
-      };
-    """
-
-    event: BEvent
-    remote: LinkStateNodeId  # this field is only used if using the attr field
-    data: LinkStateAttributes
-
-
-# ── BGP data structures ──────────────────────────────────────────────────────
-# BGP-specific types; adheres to RFC and implemented similarly in FRR>
-
-
-@dataclass
-class BgpAttributes:
-    """BGP attributes: as defined by the RFC, core attributes sent from a BGP
-    message describing a path.
-
-    For now, the BGP-LS attribute will be set as a flag indicating whether to
-    advertise or withdraw a path."""
-
-    as_path: list[int]
-    next_hop: opaque_addr_t
-    origin: uint8_t
-    mp_reach_nlri: BgpLsLinkNlri | None
-    mp_unreach_nlri: BgpLsLinkNlri | None
-    bgp_ls_attr: bool  # set or not for now
-
-
-@dataclass
-class BgpPeerUpdateMsg:
-    """BGP peer UPDATE message:"""
-
-    path_attr: BgpAttributes
 
 
 # ── Model: state, contract, transition ───────────────────────────────────────
@@ -232,10 +42,7 @@ class BgpLsLinkState:
 
     asn: uint32_t = field(default=uint32_t(100))  # arbitrary ASN for now
     ted: list[LinkStateEdge] = field(default_factory=list)
-    rib: list[BgpRibEntry] = field(default_factory=list)
-    next_id: opaque_prefix_t = field(
-        default=opaque_prefix_t(0)
-    )  # TODO check hash logic
+    rib: list[BgpLsLinkNlri] = field(default_factory=list)
 
     # ── Invariant ────────────────────────────────────────────────────────────
     def invariant(self) -> bool:
@@ -266,29 +73,27 @@ class BgpLsLinkState:
             and edge.destination != 0
             for edge in self.ted
         )
-        rib_keys_unique = no_dup(r.synth_prefix for r in self.rib)
 
         # ── Format ───────────────────────────────────────────────────────────
-        nlri_nonnull = all(r.ls_nlri is not None for r in self.rib)
+        nlri_nonnull = all(nlri is not None for nlri in self.rib)
         nlri_nodes_nonnull = all(
-            r.ls_nlri.source is not None and r.ls_nlri.destination is not None
-            for r in self.rib
+            nlri.source is not None and nlri.destination is not None
+            for nlri in self.rib
         )
-        nlri_link_nonnull = all(r.ls_nlri.link is not None for r in self.rib)
+        nlri_link_nonnull = all(nlri.link is not None for nlri in self.rib)
         nlri_nonloop = all(
-            r.ls_nlri.source.igp_router_id
-            != r.ls_nlri.destination.igp_router_id
-            for r in self.rib
+            nlri.source.igp_router_id != nlri.destination.igp_router_id
+            for nlri in self.rib
         )
 
         # ── LSDB/TED ─────────────────────────────────────────────────────────
         ted_is_referenced = all(
             any(
-                r.ls_nlri.link.interface == edge.source
-                and r.ls_nlri.link.neighbor == edge.destination
+                nlri.link.interface == edge.source
+                and nlri.link.neighbor == edge.destination
                 for edge in self.ted
             )
-            for r in self.rib
+            for nlri in self.rib
         )
 
         return (
@@ -296,7 +101,6 @@ class BgpLsLinkState:
             and ted_nonloop
             and ted_one_sys_many_ip
             and ted_nonzero_ids
-            and rib_keys_unique
             and nlri_nonnull
             and nlri_nodes_nonnull
             and nlri_link_nonnull
@@ -309,26 +113,26 @@ class BgpLsLinkState:
         self, api: BApiLinkStateUpdate
     ) -> bool:
         """Action guard. The harness must only call api_bgp_ls_edge_update when
-        this returns True. Must start at an empty state."""
+        this returns True."""
 
-        rib_empty = not self.rib
-        return rib_empty
+        return self.invariant()
 
     # ── Transition ───────────────────────────────────────────────────────────
-    def api_bgp_ls_edge_update(self, api: BApiLinkStateUpdate) -> int:
+    def api_bgp_ls_edge_update(
+        self, api: BApiLinkStateUpdate
+    ) -> BgpAttributes | None:
         """Process one zebra link-state update."""
 
-        # find and link reverse edge only if known event
-        if (
-            api.event != BEvent.SYNC
-            and api.event != BEvent.ADD
-            and api.event != BEvent.UPDATE
-        ):
-            return -1
+        # find and link reverse edge only if sync, add, or update event
+        if api.event == BEvent.UNDEF:
+            return None
+
+        if api.event == BEvent.DELETE:
+            return self._delete_edge(BApiLinkStateDelete(api))
 
         if api.data.adv == api.remote or api.data.local == api.data.remote:
             # disallow loopbacks to be appended as NLRI
-            return 0
+            return None
 
         # two-way connectivity check - in the FRR implementation, both forward
         # and reverse direction are checked
@@ -358,33 +162,51 @@ class BgpLsLinkState:
                 )
             )
 
+        ls_nlri = BgpLsLinkNlri(
+            BgpLsNode(self.asn, api.data.adv.iso_sys_id),
+            BgpLsNode(self.asn, api.remote.iso_sys_id),
+            BgpLsLink(api.data.local, api.data.remote, self.asn),
+        )
+
         # check if existing entry exists before updating
-        if self._nlri_exists(
-            api.data.adv.iso_sys_id,
-            api.remote.iso_sys_id,
-            api.data.local,
-            api.data.remote,
-        ):
-            return 0
+        if ls_nlri not in self.rib:
+            self.rib.append(ls_nlri)
 
-        # build link NLRI
-        source: BgpLsNode = BgpLsNode(self.asn, api.data.adv.iso_sys_id)
-        destination: BgpLsNode = BgpLsNode(self.asn, api.remote.iso_sys_id)
-        link: BgpLsLink = BgpLsLink(
-            interface=api.data.local,
-            neighbor=api.data.remote,
-            remote_asn=self.asn,
+        return BgpAttributes(mp_reach_nlri=ls_nlri)
+
+    def to_dict(self) -> dict:
+        return {
+            "asn": clamp_u32(self.asn),
+            "linkstate_ted": [e.to_dict() for e in self.ted],
+            "rib_nlri": [nlri.to_dict() for nlri in self.rib],
+        }
+
+    def _delete_edge(self, api: BApiLinkStateDelete) -> BgpAttributes | None:
+        """Treat the zebra link-state update as a delete message."""
+
+        edge = self._find_edge(api.data.local, api.data.remote)
+
+        if not edge:
+            return None
+
+        # build search NLRI
+        nlri: BgpLsLinkNlri = BgpLsLinkNlri(
+            BgpLsNode(self.asn, api.data.adv.iso_sys_id),
+            BgpLsNode(self.asn, api.remote.iso_sys_id),
+            BgpLsLink(
+                interface=api.data.local,
+                neighbor=api.data.remote,
+                remote_asn=self.asn,
+            ),
         )
 
-        nlri: BgpLsLinkNlri = BgpLsLinkNlri(source, destination, link)
+        if nlri in self.rib:
+            self.rib.remove(nlri)
 
-        rib_entry: BgpRibEntry = BgpRibEntry(
-            self._allocate_new_id(), ls_nlri=nlri
-        )
+        # withdraw
+        self.ted.remove(edge)
 
-        self.rib.append(rib_entry)
-
-        return 0
+        return BgpAttributes(mp_unreach_nlri=nlri)
 
     def _find_edge(
         self, local: opaque_addr_t, remote: opaque_addr_t
@@ -395,30 +217,6 @@ class BgpLsLinkState:
             if e.source == local and e.destination == remote:
                 return e
         return None
-
-    def _nlri_exists(
-        self,
-        local_sys_id: sys_id_t,
-        remote_sys_id: sys_id_t,
-        local: opaque_addr_t,
-        remote: opaque_addr_t,
-    ) -> bool:
-        for entry in self.rib:
-            if (
-                entry.ls_nlri.source.igp_router_id == local_sys_id
-                and entry.ls_nlri.destination.igp_router_id == remote_sys_id
-                and entry.ls_nlri.link.interface == local
-                and entry.ls_nlri.link.neighbor == remote
-            ):
-                return True
-        return False
-
-    def _allocate_new_id(self) -> opaque_prefix_t:
-        """Allocates a new hash ID (corresponding to the synthetic prefix) for
-        an entry within the RIB."""
-        prev: opaque_prefix_t = self.next_id
-        self.next_id = opaque_prefix_t(self.next_id + 1)
-        return prev
 
     def _sys_id_matches_ip(self, edges: list[LinkStateEdge]) -> bool:
         """Verifies a strict 1:N mapping between system IDs and IPs."""

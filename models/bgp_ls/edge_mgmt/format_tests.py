@@ -30,12 +30,11 @@ sys.path.insert(0, os.path.join(_ROOT, "models"))
 
 print(f"_ROOT: {_ROOT}")
 
-from mbt.modeling_primitives import clamp_u32, to_ipv6_opaque_address
+from bgp_ls.linkstate_data import BApiLinkStateUpdate, BEvent
 from bgp_ls.edge_mgmt.api_bgp_ls_edge_update import (
-    BApiLinkStateUpdate,
     BgpLsLinkState,
+    BgpAttributes,
 )
-from bgp_ls.edge_mgmt.igp_primitives import to_sys_id
 
 # Reaching for the underscore-prefixed helpers from crosshair_target.
 # They're the canonical "normalize + build" trio; reusing them here keeps
@@ -64,7 +63,7 @@ class TestCase:
     initial_state: BgpLsLinkState | None = None
     api_param: BApiLinkStateUpdate | None = None
     final_state: BgpLsLinkState | None = None
-    response: int | None = None
+    update_msg: BgpAttributes | None = None
 
 
 def read_argdict(path: str) -> Iterator[TestCase]:
@@ -90,8 +89,9 @@ def canonicalize(inputs: dict) -> dict:
     After this pass, two raw inputs that map to the same model behavior
     become byte-identical, which lets us dedupe."""
 
-    api_src_sys_id, api_dest_sys_id, api_local, api_remote = (
+    api_event, api_src_sys_id, api_dest_sys_id, api_local, api_remote = (
         _correct_api_params(
+            inputs["api_event"],
             inputs["api_src_sys_id"],
             inputs["api_dest_sys_id"],
             inputs["api_local"],
@@ -107,8 +107,8 @@ def canonicalize(inputs: dict) -> dict:
     )
     return {
         "ted_seed": ted_seed,
+        "api_event": api_event,
         "api_asn": inputs["api_asn"],
-        "api_metric": inputs["api_metric"],
         "api_src_sys_id": api_src_sys_id,
         "api_dest_sys_id": api_dest_sys_id,
         "api_level": inputs["api_level"],
@@ -121,11 +121,11 @@ def _hash_key(canonical: dict) -> tuple:
     """Hashable fingerprint of canonical inputs (lists become tuples)."""
     return (
         tuple(
-            (asn, src_sys_id, dest_sys_id, src, dest)
-            for asn, src_sys_id, dest_sys_id, src, dest in canonical["ted_seed"]
+            (src_sys_id, dest_sys_id, src, dest)
+            for src_sys_id, dest_sys_id, src, dest in canonical["ted_seed"]
         ),
+        canonical["api_event"],
         canonical["api_asn"],
-        canonical["api_metric"],
         canonical["api_src_sys_id"],
         canonical["api_dest_sys_id"],
         canonical["api_level"],
@@ -152,7 +152,9 @@ def read_and_dedup_argdict(path: str) -> Iterator[TestCase]:
 
 def evaluate(
     canonical: dict,
-) -> tuple[BgpLsLinkState, BApiLinkStateUpdate, BgpLsLinkState, int]:
+) -> tuple[
+    BgpLsLinkState, BApiLinkStateUpdate, BgpLsLinkState, BgpAttributes | None
+]:
     """Re-execute the model on canonical inputs.
 
     Returns (initial_state, api_param, final_state, downstream_msgs).
@@ -176,71 +178,6 @@ def evaluate(
     return initial_state, api, final_state, res
 
 
-def _state_to_dict(s: BgpLsLinkState) -> dict:
-    return {
-        "asn": clamp_u32(s.asn),
-        "linkstate_ted": [
-            {
-                "asn": clamp_u32(e.asn),
-                "source": to_ipv6_opaque_address(e.source),
-                "destination": to_ipv6_opaque_address(e.destination),
-                "source_node": {
-                    "iso_sys_id": to_sys_id(e.source_node.iso_sys_id),
-                    "level": e.source_node.level,
-                },
-                "destination_node": {
-                    "iso_sys_id": to_sys_id(e.dest_node.iso_sys_id),
-                    "level": e.dest_node.level,
-                },
-            }
-            for e in s.ted
-        ],
-        "rib_nlri": [
-            {
-                "source": {
-                    "asn": clamp_u32(e.ls_nlri.source.asn),
-                    "igp_router_id": to_sys_id(e.ls_nlri.source.igp_router_id),
-                },
-                "destination": {
-                    "asn": clamp_u32(e.ls_nlri.destination.asn),
-                    "igp_router_id": to_sys_id(
-                        e.ls_nlri.destination.igp_router_id
-                    ),
-                },
-                "link": {
-                    "interface": to_ipv6_opaque_address(
-                        e.ls_nlri.link.interface
-                    ),
-                    "neighbor": to_ipv6_opaque_address(e.ls_nlri.link.neighbor),
-                    "remote_asn": clamp_u32(e.ls_nlri.link.remote_asn),
-                },
-            }
-            for e in s.rib
-        ],
-    }
-
-
-def _api_to_dict(a: BApiLinkStateUpdate) -> dict:
-    return {
-        "event": a.event,
-        "remote": {
-            "iso_sys_id": to_sys_id(a.remote.iso_sys_id),
-            "level": a.remote.level,
-        },
-        "data": {
-            "adv": {
-                "iso_sys_id": to_sys_id(a.data.adv.iso_sys_id),
-                "level": a.data.adv.level,
-            },
-            "name": a.data.name if a.data.name else "",
-            "metric": a.data.metric,
-            "local": to_ipv6_opaque_address(a.data.local),
-            "remote": to_ipv6_opaque_address(a.data.remote),
-            "valid": True,  # set to true for now
-        },
-    }
-
-
 def format_test_case(tc: TestCase) -> dict:
     """Re-execute the model and produce the formatted output dict.
 
@@ -250,15 +187,21 @@ def format_test_case(tc: TestCase) -> dict:
     tc.initial_state = initial_state
     tc.api_param = api
     tc.final_state = final_state
-    tc.response = res
-    return {
+    tc.update_msg = res
+
+    formatted = {
         "TestId": tc.test_id,
-        "Op": "api_bgp_ls_edge_update",
-        "InitialState": _state_to_dict(initial_state),
-        "ApiParam": _api_to_dict(api),
-        "FinalState": _state_to_dict(final_state),
-        "Response": res,
+        "Op": f"api_bgp_ls_edge_{BEvent(api.event).name.lower()}",
+        "InitialState": initial_state.to_dict(),
+        "ApiParam": api.to_dict(),
+        "FinalState": final_state.to_dict(),
+        # "UpdateMessage": res.to_dict(),
     }
+
+    if res and (msg_dict := res.to_dict()):
+        formatted["UpdateMessage"] = msg_dict
+
+    return formatted
 
 
 def main():
