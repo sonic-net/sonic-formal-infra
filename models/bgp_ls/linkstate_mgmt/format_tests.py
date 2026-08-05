@@ -1,9 +1,9 @@
 """Format script for CrossHair arg_dictionary test inputs.
 
-Reads tests/edge_update_argdict.txt (or any arg_dictionary-format file from
-`crosshair cover`), canonicalizes and dedupes inputs, re-executes the
-model on each canonical input, and writes a JSON file of fully-populated
-test cases that can compare against actual bgpd execution.
+Reads tests/linkstate_update_argdict.txt (or any arg_dictionary-format file from
+`crosshair cover`), canonicalizes and dedupes inputs, re-executes the model on
+each canonical input, and writes a JSON file of fully-populated test cases that
+can compare against actual bgpd execution.
 
 Run from anywhere:
     python3 path/to/format_tests.py [INPUT] [-o OUTPUT]
@@ -19,7 +19,7 @@ from collections.abc import Iterator
 
 _HERE = os.path.dirname(
     os.path.abspath(__file__)
-)  # <project-root>/models/bgp_ls/edge_mgmt/
+)  # <project-root>/models/bgp_ls/linkstate_mgmt/
 _ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(_HERE))
 )  # root project directory
@@ -30,24 +30,24 @@ sys.path.insert(0, os.path.join(_ROOT, "models"))
 
 print(f"_ROOT: {_ROOT}")
 
-from bgp_ls.linkstate_data import BApiLinkStateUpdate, BEvent
-from bgp_ls.edge_mgmt.api_bgp_ls_edge_update import (
+from models.bgp_ls.linkstate_mgmt.linkstate_data import (
+    BApiLinkStateUpdate,
+    LinkStateEvent,
+)
+from bgp_ls.linkstate_mgmt.api_bgp_ls_linkstate_update import (
     BgpLsLinkState,
     BgpAttributes,
 )
-
-# Reaching for the underscore-prefixed helpers from crosshair_target.
-# They're the canonical "normalize + build" trio; reusing them here keeps
-# the postprocessor exactly in sync with the symbolic entry point.
-from bgp_ls.edge_mgmt.crosshair_target import (
-    _correct_api_params,
+from bgp_ls.linkstate_mgmt.crosshair_target import (
+    _correct_edge_params,
+    _correct_subnet_params,
     _correct_ted_seed,
     _build_state_and_api,
 )
 
 
-DEFAULT_INPUT = os.path.join(_HERE, "tests", "edge_update_argdict.txt")
-DEFAULT_OUTPUT = os.path.join(_HERE, "tests", "edge_update_formatted.json")
+DEFAULT_INPUT = os.path.join(_HERE, "tests", "linkstate_update_argdict.txt")
+DEFAULT_OUTPUT = os.path.join(_HERE, "tests", "linkstate_update_formatted.json")
 
 
 @dataclass
@@ -89,31 +89,32 @@ def canonicalize(inputs: dict) -> dict:
     After this pass, two raw inputs that map to the same model behavior
     become byte-identical, which lets us dedupe."""
 
-    api_event, api_src_sys_id, api_dest_sys_id, api_local, api_remote = (
-        _correct_api_params(
-            inputs["api_event"],
-            inputs["api_src_sys_id"],
-            inputs["api_dest_sys_id"],
-            inputs["api_local"],
-            inputs["api_remote"],
-        )
+    api_ls = inputs["api_ls"]
+    match len(api_ls):
+        case 4:
+            api_ls = _correct_edge_params(*api_ls)
+        case 2:
+            api_ls = _correct_subnet_params(*api_ls)
+        case _:
+            raise ValueError(
+                "Invalid number of parameters passed for api_ls - must be 2 "
+                "(prefix) or 4 (link)"
+            )
+
+    link_seed, prefix_seed = _correct_ted_seed(
+        inputs["link_seed"],
+        inputs["prefix_seed"],
+        api_ls if len(api_ls) == 4 else None,
+        api_ls if len(api_ls) == 2 else None,
     )
-    ted_seed = _correct_ted_seed(
-        inputs["ted_seed"],
-        api_src_sys_id,
-        api_dest_sys_id,
-        api_local,
-        api_remote,
-    )
+
     return {
-        "ted_seed": ted_seed,
-        "api_event": api_event,
+        "link_seed": link_seed,
+        "prefix_seed": prefix_seed,
+        "api_event": inputs["api_event"],
         "api_asn": inputs["api_asn"],
-        "api_src_sys_id": api_src_sys_id,
-        "api_dest_sys_id": api_dest_sys_id,
         "api_level": inputs["api_level"],
-        "api_local": api_local,
-        "api_remote": api_remote,
+        "api_ls": api_ls,
     }
 
 
@@ -122,15 +123,15 @@ def _hash_key(canonical: dict) -> tuple:
     return (
         tuple(
             (src_sys_id, dest_sys_id, src, dest)
-            for src_sys_id, dest_sys_id, src, dest in canonical["ted_seed"]
+            for src_sys_id, dest_sys_id, src, dest in canonical["link_seed"]
+        ),
+        tuple(
+            (adv_node, prefix) for adv_node, prefix in canonical["prefix_seed"]
         ),
         canonical["api_event"],
         canonical["api_asn"],
-        canonical["api_src_sys_id"],
-        canonical["api_dest_sys_id"],
         canonical["api_level"],
-        canonical["api_local"],
-        canonical["api_remote"],
+        canonical["api_ls"],
     )
 
 
@@ -151,6 +152,7 @@ def read_and_dedup_argdict(path: str) -> Iterator[TestCase]:
 
 
 def evaluate(
+    test_id: int,
     canonical: dict,
 ) -> tuple[
     BgpLsLinkState, BApiLinkStateUpdate, BgpLsLinkState, BgpAttributes | None
@@ -168,12 +170,14 @@ def evaluate(
     print(f"{canonical!r}")
     initial_state, api = _build_state_and_api(**canonical)
     assert initial_state.invariant(), (
-        f"canonicalized inputs produced a non-invariant state: {canonical!r}"
+        f"canonicalized inputs produced a non-invariant state: {canonical!r} "
+        f"(ID: {test_id})"
     )
     final_state = copy.deepcopy(initial_state)
-    res = final_state.api_bgp_ls_edge_update(api)
+    res = final_state.api_bgp_ls_linkstate_update(api)
     assert final_state.invariant(), (
-        f"transition broke invariant; inputs={canonical!r}, res={res!r}"
+        f"transition broke invariant; inputs={canonical!r}, res={res!r} "
+        f"(ID: {test_id})"
     )
     return initial_state, api, final_state, res
 
@@ -183,7 +187,7 @@ def format_test_case(tc: TestCase) -> dict:
 
     Populates tc.initial_state / api_param / final_state / downstream_msgs
     in place so in-memory consumers see a fully-formed TestCase."""
-    initial_state, api, final_state, res = evaluate(tc.inputs)
+    initial_state, api, final_state, res = evaluate(tc.test_id, tc.inputs)
     tc.initial_state = initial_state
     tc.api_param = api
     tc.final_state = final_state
@@ -191,11 +195,10 @@ def format_test_case(tc: TestCase) -> dict:
 
     formatted = {
         "TestId": tc.test_id,
-        "Op": f"api_bgp_ls_edge_{BEvent(api.event).name.lower()}",
+        "Op": f"api_bgp_ls_linkstate_{LinkStateEvent(api.event).name.lower()}",
         "InitialState": initial_state.to_dict(),
         "ApiParam": api.to_dict(),
         "FinalState": final_state.to_dict(),
-        # "UpdateMessage": res.to_dict(),
     }
 
     if res and (msg_dict := res.to_dict()):
@@ -207,8 +210,8 @@ def format_test_case(tc: TestCase) -> dict:
 def main():
     parser = argparse.ArgumentParser(
         description=(
-            "Read a CrossHair arg_dictionary file, canonicalize + dedupe inputs, "
-            "re-execute the model, and emit JSON test cases."
+            "Read a CrossHair arg_dictionary file, canonicalize + dedupe inputs"
+            ", re-execute the model, and emit JSON test cases."
         ),
     )
     parser.add_argument(

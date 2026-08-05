@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Generate arg_dictionary inputs from CrossHair for api_bgp_ls_edge_update.
+# Generate arg_dictionary inputs from CrossHair for api_bgp_ls_linkstate_update.
 #
 # Run from models/:
-#   bgp_ls/edge_mgmt/gen_tests.sh
+#   bgp_ls/linkstate_mgmt/gen_tests.sh
 #
 # Overridable via environment variables:
 #   COVERAGE_TYPE                  (default: path)
@@ -11,8 +11,8 @@
 #   MAX_UNINTERESTING_ITERATIONS   (default: 1000)
 set -euo pipefail
 
-TARGET="bgp_ls.edge_mgmt.crosshair_target.api_bgp_ls_edge_update_with_precondition"
-OUTPUT_DIR="bgp_ls/edge_mgmt/tests"
+TARGET="bgp_ls.linkstate_mgmt.crosshair_target.api_bgp_ls_linkstate_update_with_precondition"
+OUTPUT_DIR="bgp_ls/linkstate_mgmt/tests"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 OUTPUT_FILE="$OUTPUT_DIR/args_${TIMESTAMP}.txt"
 LOG_FILE="$OUTPUT_DIR/crosshair_argdict_${TIMESTAMP}.log"
