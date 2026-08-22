@@ -72,7 +72,7 @@ class BgpLsLinkState:
         ted_one_sys_many_ip = self._sys_id_matches_ip(ted_edges)
         ted_nonzero_ids = all(
             edge.source_node.iso_sys_id != 0
-            and edge.dest_node.iso_sys_id != 0
+            and edge.destination_node.iso_sys_id != 0
             and edge.source != 0
             and edge.destination != 0
             for edge in ted_edges
@@ -158,12 +158,10 @@ class BgpLsLinkState:
 
         # route to appropriate action
         match api.data:
-            case LinkStateAttributes() if (
-                api.remote and api.event == LinkStateEvent.DELETE
-            ):
-                return self._delete_edge(api.data, api.remote)
-            case LinkStateAttributes() if api.remote:
-                return self._update_edge(api.data, api.remote)
+            case LinkStateAttributes() if api.event == LinkStateEvent.DELETE:
+                return self._delete_edge(api.data)
+            case LinkStateAttributes():
+                return self._update_edge(api.data)
             case LinkStatePrefix() if api.event == LinkStateEvent.DELETE:
                 return self._delete_subnet(api.data)
             case LinkStatePrefix():
@@ -180,14 +178,12 @@ class BgpLsLinkState:
             "rib_nlri": [nlri.to_dict() for nlri in self.rib],
         }
 
-    def _update_edge(
-        self, attr: LinkStateAttributes, remote: LinkStateNodeId
-    ) -> BgpAttributes | None:
+    def _update_edge(self, attr: LinkStateAttributes) -> BgpAttributes | None:
         """Updates the model's state by adding a new edge.
 
         Corresponds to `bgp_ls_originate_link` in FRR."""
 
-        if attr.adv == remote or attr.local == attr.remote:
+        if attr.adv_node == attr.remote_node or attr.local == attr.remote:
             # disallow loopbacks to be appended as NLRI
             return None
 
@@ -199,10 +195,10 @@ class BgpLsLinkState:
             self.ted.append(
                 LinkStateEdge(
                     self.asn,
-                    attr.adv,
-                    remote,
                     attr.local,
                     attr.remote,
+                    attr.adv_node,
+                    attr.remote_node,
                 )
             )
 
@@ -212,16 +208,16 @@ class BgpLsLinkState:
             self.ted.append(
                 LinkStateEdge(
                     self.asn,
-                    remote,
-                    attr.adv,
                     attr.remote,
                     attr.local,
+                    attr.remote_node,
+                    attr.adv_node,
                 )
             )
 
         ls_nlri = BgpLsLinkNlri(
-            BgpLsNode(self.asn, attr.adv.iso_sys_id),
-            BgpLsNode(self.asn, remote.iso_sys_id),
+            BgpLsNode(self.asn, attr.adv_node.iso_sys_id),
+            BgpLsNode(self.asn, attr.remote_node.iso_sys_id),
             BgpLsLink(attr.local, attr.remote, self.asn),
         )
 
@@ -243,7 +239,7 @@ class BgpLsLinkState:
 
         ls_nlri = BgpLsPrefixNlri(
             BgpLsNode(self.asn, prefix.adv.iso_sys_id),
-            BgpLsPrefix(BgpRoute.LOCAL, prefix.prefix),
+            BgpLsPrefix(BgpRouteType.LOCAL, prefix.prefix),
         )
 
         if ls_nlri not in self.rib:
@@ -251,9 +247,7 @@ class BgpLsLinkState:
 
         return BgpAttributes(mp_reach_nlri=ls_nlri)
 
-    def _delete_edge(
-        self, attr: LinkStateAttributes, remote: LinkStateNodeId
-    ) -> BgpAttributes | None:
+    def _delete_edge(self, attr: LinkStateAttributes) -> BgpAttributes | None:
         """Updates the model's state by withdrawing an existing edge.
 
         Corresponds to `bgp_ls_withdraw_link` in FRR."""
@@ -262,8 +256,8 @@ class BgpLsLinkState:
 
         # build search NLRI
         ls_nlri = BgpLsLinkNlri(
-            BgpLsNode(self.asn, attr.adv.iso_sys_id),
-            BgpLsNode(self.asn, remote.iso_sys_id),
+            BgpLsNode(self.asn, attr.adv_node.iso_sys_id),
+            BgpLsNode(self.asn, attr.remote_node.iso_sys_id),
             BgpLsLink(
                 interface=attr.local,
                 neighbor=attr.remote,
@@ -293,7 +287,7 @@ class BgpLsLinkState:
         # build search NLRI - TODO BgpRoute as a free var
         ls_nlri = BgpLsPrefixNlri(
             BgpLsNode(self.asn, prefix.adv.iso_sys_id),
-            BgpLsPrefix(BgpRoute.LOCAL, prefix.prefix),
+            BgpLsPrefix(BgpRouteType.LOCAL, prefix.prefix),
         )
 
         to_update = False
@@ -335,41 +329,36 @@ class BgpLsLinkState:
     def _sys_id_matches_ip(self, edges: list[LinkStateEdge]) -> bool:
         """Verifies a strict 1:N mapping between system IDs and IPs."""
 
-        sys_m = {}
+        pairs = []
 
         for e in edges:
-            # fmt: off
-            pairs = (
-                (e.source_node, e.source,),
-                (e.dest_node, e.destination),
+            edge_pairs = (
+                (e.source_node, e.source),
+                (e.destination_node, e.destination),
             )
-            # fmt: on
-            for node, ip in pairs:
-                if any(
-                    sys_id != node and ip in ips
-                    for sys_id, ips in sys_m.items()
-                ):
-                    return False
 
-                sys_m.setdefault(node, set()).add(ip)
+            for node_i, ip_i in edge_pairs:
+                for node_j, ip_j in pairs:
+                    if ip_i == ip_j and node_i != node_j:
+                        return False
+
+                pairs.append((node_i, ip_i))
 
         return True
 
     def _sys_id_matches_prefix(self, prefixes: list[BgpLsPrefixNlri]) -> bool:
         """Verifies a strict 1:N mapping between system IDs and IP prefixes."""
 
-        sys_m = {}
+        pairs = []
 
         for p in prefixes:
-            if any(
-                sys_id != p.local_node.igp_router_id
-                and p.prefix.prefix in prefixes
-                for sys_id, prefixes in sys_m.items()
-            ):
-                return False
+            for node_i, prefix_i in pairs:
+                if (
+                    prefix_i == p.prefix.prefix
+                    and node_i != p.local_node.igp_router_id
+                ):
+                    return False
 
-            sys_m.setdefault(p.local_node.igp_router_id, set()).add(
-                p.prefix.prefix
-            )
+            pairs.append((p.local_node.igp_router_id, p.prefix.prefix))
 
         return True

@@ -233,10 +233,10 @@ def _build_state_and_api(
         state.ted.append(
             LinkStateEdge(
                 uint32_t(api_asn),
-                LinkStateNodeId(sys_id_t(src_sys_id), uint8_t(api_level)),
-                LinkStateNodeId(sys_id_t(dest_sys_id), uint8_t(api_level)),
                 opaque_addr_t(local),
                 opaque_addr_t(remote),
+                LinkStateNodeId(sys_id_t(src_sys_id), uint8_t(api_level)),
+                LinkStateNodeId(sys_id_t(dest_sys_id), uint8_t(api_level)),
             )
         )
         state.rib.append(
@@ -257,7 +257,7 @@ def _build_state_and_api(
         state.rib.append(
             BgpLsPrefixNlri(
                 BgpLsNode(uint32_t(api_asn), sys_id_t(adv_node)),
-                BgpLsPrefix(BgpRoute.LOCAL, opaque_prefix_t(prefix)),
+                BgpLsPrefix(BgpRouteType.LOCAL, opaque_prefix_t(prefix)),
             )
         )
 
@@ -268,17 +268,19 @@ def _build_state_and_api(
             src_node = LinkStateNodeId(
                 sys_id_t(api_src_sys_id), uint8_t(api_level)
             )
-            attr = LinkStateAttributes(
-                adv=src_node,
-                local=opaque_addr_t(api_local),
-                remote=opaque_addr_t(api_remote),
-            )
             dest_node = LinkStateNodeId(
                 sys_id_t(api_dest_sys_id), uint8_t(api_level)
             )
 
+            attr = LinkStateAttributes(
+                local=opaque_addr_t(api_local),
+                remote=opaque_addr_t(api_remote),
+                adv_node=src_node,
+                remote_node=dest_node,
+            )
+
             api = BApiLinkStateUpdate(
-                event=LinkStateEvent(api_event), remote=dest_node, data=attr
+                event=LinkStateEvent(api_event), data=attr
             )
         case (api_adv, api_prefix):
             # prefix update

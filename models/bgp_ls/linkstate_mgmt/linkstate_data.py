@@ -20,7 +20,7 @@ from modeling_primitives import (
 # BGP-LS-specific types; adheres to RFC and implemented similarly within FRR.
 
 
-class BgpRoute(IntEnum):
+class BgpRouteType(IntEnum):
     LOCAL = 1
     ATTACHED = 2
     EXTERNAL_BGP = 3
@@ -74,7 +74,7 @@ class BgpLsPrefix:
     IP reachability information to each of its BGP next hops should be
     advertised by the advertising node."""
 
-    bgp_route_type: BgpRoute
+    bgp_route_type: BgpRouteType
     prefix: opaque_prefix_t
 
     def to_dict(self) -> dict:
@@ -100,6 +100,7 @@ class BgpLsLinkNlri:
 
     def to_dict(self) -> dict:
         return {
+            "type": "link_nlri",
             "source": self.source.to_dict(),
             "destination": self.destination.to_dict(),
             "link": self.link.to_dict(),
@@ -120,6 +121,7 @@ class BgpLsPrefixNlri:
 
     def to_dict(self) -> dict:
         return {
+            "type": "prefix_nlri",
             "local_node": self.local_node.to_dict(),
             "prefix": self.prefix.to_dict(),
         }
@@ -161,18 +163,19 @@ class LinkStateEdge:
     protocol."""
 
     asn: uint32_t
-    source_node: LinkStateNodeId
-    dest_node: LinkStateNodeId
     source: opaque_addr_t
     destination: opaque_addr_t
+    source_node: LinkStateNodeId
+    destination_node: LinkStateNodeId
 
     def to_dict(self) -> dict:
         return {
+            "type": "edge",
             "asn": clamp_u32(self.asn),
             "source": to_ipv6_opaque_address(self.source),
             "destination": to_ipv6_opaque_address(self.destination),
             "source_node": self.source_node.to_dict(),
-            "destination_node": self.dest_node.to_dict(),
+            "destination_node": self.destination_node.to_dict(),
         }
 
 
@@ -187,15 +190,18 @@ class LinkStateAttributes:
     BGP-LS propagators to pass on.
     """
 
-    adv: LinkStateNodeId  # advertising router
     local: opaque_addr_t  # local IPv6 address
     remote: opaque_addr_t  # remote IPv6 address
+    adv_node: LinkStateNodeId  # advertising router
+    remote_node: LinkStateNodeId  # remote router
 
     def to_dict(self) -> dict:
         return {
-            "adv": self.adv.to_dict(),
+            "type": "attributes",
             "local": to_ipv6_opaque_address(self.local),
             "remote": to_ipv6_opaque_address(self.remote),
+            "adv_node": self.adv_node.to_dict(),
+            "remote_node": self.remote_node.to_dict(),
         }
 
 
@@ -211,6 +217,7 @@ class LinkStateSubnet:
 
     def to_dict(self) -> dict:
         return {
+            "type": "subnet",
             "prefix": to_ipv6_opaque_prefix(self.prefix),
         }
 
@@ -231,6 +238,7 @@ class LinkStatePrefix:
 
     def to_dict(self) -> dict:
         return {
+            "type": "prefix",
             "adv": self.adv.to_dict(),
             "prefix": to_ipv6_opaque_prefix(self.prefix),
         }
@@ -261,15 +269,9 @@ class BApiLinkStateUpdate:
 
     event: LinkStateEvent
     data: LinkStateAttributes | LinkStatePrefix
-    remote: LinkStateNodeId | None = None  # only used if using the attr field
 
     def to_dict(self) -> dict:
-        msg_dict = {"event": self.event, "data": self.data.to_dict()}
-
-        if self.remote:
-            msg_dict["remote"] = self.remote.to_dict()
-
-        return msg_dict
+        return {"event": self.event, "data": self.data.to_dict()}
 
 
 # ── BGP data structures ───────────────────────────────────────────────────────
