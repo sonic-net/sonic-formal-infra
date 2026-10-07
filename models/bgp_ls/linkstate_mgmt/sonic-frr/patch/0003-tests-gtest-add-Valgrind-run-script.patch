@@ -1,0 +1,58 @@
+From 57f0cc36a30606e874e27e1cb455ed91a4bfd4db Mon Sep 17 00:00:00 2001
+From: Gabe Lapingcao <mgultra2018@gmail.com>
+Date: Thu, 16 Jul 2026 12:22:26 -0700
+Subject: [PATCH 03/14] [tests/gtest]: add Valgrind run script
+
+Valgrind is used extensively to support the discovery of bugs introduced
+during test development. The run script saves output files into the
+`logs/` directory with the timestamp of the Valgrind leak check run.
+Each log details a full leak report on the `model_tests` executable
+built using CMake (must be located at `bin/Debug/model_tests`).
+
+Signed-off-by: Gabe Lapingcao <mgultra2018@gmail.com>
+---
+ tests/gtest/.gitignore      |  3 +++
+ tests/gtest/run_valgrind.sh | 17 +++++++++++++++++
+ 2 files changed, 20 insertions(+)
+ create mode 100755 tests/gtest/run_valgrind.sh
+
+diff --git a/tests/gtest/.gitignore b/tests/gtest/.gitignore
+index 0298876a65..d0ca445dd6 100644
+--- a/tests/gtest/.gitignore
++++ b/tests/gtest/.gitignore
+@@ -18,6 +18,9 @@ compile_commands.json
+ .DS_Store
+ Thumbs.db
+ 
++# --- Logs ---
++logs/
++
+ # --- Misc ---
+ tests/*.json
+ !tests/edge_update_formatted.json
+diff --git a/tests/gtest/run_valgrind.sh b/tests/gtest/run_valgrind.sh
+new file mode 100755
+index 0000000000..8c4484c494
+--- /dev/null
++++ b/tests/gtest/run_valgrind.sh
+@@ -0,0 +1,17 @@
++#!/bin/bash
++
++TESTS="/gtest/bin/Debug/model_tests"
++OUTPUT_DIR="/gtest/logs"
++TIMESTAMP=$(TZ="US/Pacific" date +'%F_%H_%M_%S')
++LOG_FILE="$OUTPUT_DIR/valgrind_$TIMESTAMP.log"
++
++if [ ! -d "$OUTPUT_DIR" ]; then
++    mkdir -p "$OUTPUT_DIR"
++fi
++
++if [ -f "$TESTS" ]; then
++    # run valgrind
++    valgrind --leak-check=full --log-file="$LOG_FILE" "$TESTS"
++else
++    echo "$TESTS does not exist. Please build with CMake."
++fi
+-- 
+2.34.1
+

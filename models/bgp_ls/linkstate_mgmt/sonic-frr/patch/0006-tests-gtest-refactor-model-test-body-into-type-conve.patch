@@ -1,0 +1,791 @@
+From 03ef78286f33b5d268e664d1382d0e422a2bbee0 Mon Sep 17 00:00:00 2001
+From: Gabe Lapingcao <mgultra2018@gmail.com>
+Date: Sun, 19 Jul 2026 14:55:15 -0700
+Subject: [PATCH 06/14] [tests/gtest]: refactor model test body into type
+ conversion and message sending functions
+
+Separates test body code into modularized functions, consisting of the
+following:
+
+- Type conversion functions from the model format parsed from JSON to
+  FRR internal data structures.
+- Message sending functions for notifying the test environment BGP
+  instance about advertised link-state information.
+- Utility functions for parsing and validating ISO sys IDs and IPv6
+  addresses in each model test case.
+
+Signed-off-by: Gabe Lapingcao <mgultra2018@gmail.com>
+---
+ tests/gtest/CMakeLists.txt                    |   1 +
+ tests/gtest/include/common_data.h             |  12 +
+ tests/gtest/include/frr_bridge.h              |  21 ++
+ tests/gtest/include/test_bgp_ls_edge_update.h | 119 ++++++++
+ tests/gtest/include/utils.hpp                 |  78 +++++
+ tests/gtest/src/common_data.cpp               |  15 +
+ tests/gtest/src/frr_bridge.c                  |  67 ++++-
+ tests/gtest/src/test_bgp_ls_edge_update.cpp   | 280 ++++++++----------
+ 8 files changed, 416 insertions(+), 177 deletions(-)
+ create mode 100644 tests/gtest/include/test_bgp_ls_edge_update.h
+ create mode 100644 tests/gtest/include/utils.hpp
+ create mode 100644 tests/gtest/src/common_data.cpp
+
+diff --git a/tests/gtest/CMakeLists.txt b/tests/gtest/CMakeLists.txt
+index eb549e4e00..14afab9883 100644
+--- a/tests/gtest/CMakeLists.txt
++++ b/tests/gtest/CMakeLists.txt
+@@ -52,6 +52,7 @@ find_library(LIBRFP
+ 
+ add_executable(model_tests 
+     "src/bgpd_env.cpp"
++    "src/common_data.cpp"
+     "src/main.cpp" 
+     "src/test_bgp_ls_edge_update.cpp" 
+ 
+diff --git a/tests/gtest/include/common_data.h b/tests/gtest/include/common_data.h
+index 0a6a04137d..a0103c6e2e 100644
+--- a/tests/gtest/include/common_data.h
++++ b/tests/gtest/include/common_data.h
+@@ -6,6 +6,8 @@
+ #include <string>
+ #include <vector>
+ 
++#include "utils.hpp"
++
+ using sys_id_t = std::string;
+ using prefix_t = std::string;
+ using addr_t = std::string;
+@@ -68,6 +70,8 @@ struct LinkStateNodeId {
+ };
+ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(LinkStateNodeId, iso_sys_id, level)
+ 
++struct BApiLinkStateUpdate;
++
+ /**
+  * @brief Unidirectional path between two nodes in a network.
+  *
+@@ -82,6 +86,14 @@ struct LinkStateEdge {
+   LinkStateNodeId destination_node;
+   addr_t source;
+   addr_t destination;
++
++  /**
++   * @brief Converts `LinkStateEdge` to `BApiLinkStateUpdate`.
++   *
++   * Mainly needed for populating BGP-LS's TED before the main test run within
++   * the test suite.
++   */
++  explicit operator BApiLinkStateUpdate() const;
+ };
+ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(LinkStateEdge, asn, source_node,
+                                    destination_node, source, destination)
+diff --git a/tests/gtest/include/frr_bridge.h b/tests/gtest/include/frr_bridge.h
+index d4b88a172d..31548b4897 100644
+--- a/tests/gtest/include/frr_bridge.h
++++ b/tests/gtest/include/frr_bridge.h
+@@ -1,6 +1,14 @@
+ #ifndef FRR_BRIDGE_H
+ #define FRR_BRIDGE_H
+ 
++#include <stdbool.h>
++
++#define UNKNOWN LS_UNKNOWN
++#define delete to_delete
++#include "lib/link_state.h"
++#undef delete
++#undef UNKNOWN
++
+ #include "lib/stream.h"
+ #include "sbuf.h"  // modified version of lib/sbuf.h
+ 
+@@ -49,6 +57,19 @@ void bridge_send_message(struct stream* s, uint8_t msg_type);
+  */
+ void bridge_show_ted(struct sbuf* sbuf);
+ 
++/**
++ * @brief Checks to see if an edge exists within BGP-LS's TED.
++ *
++ * This function checks two-way connectivity. Therefore, test cases must send
++ * both the forward edge and the reverse edge to the BGP instance to ensure this
++ * function returns true.
++ *
++ * @param attr      Link-state attributes corresponding to the edge to check.
++ * @return          True if the forward and reverse edge exists; false
++ *                      otherwise.
++ */
++bool bridge_edge_exists_ted(struct ls_attributes* attr);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/tests/gtest/include/test_bgp_ls_edge_update.h b/tests/gtest/include/test_bgp_ls_edge_update.h
+new file mode 100644
+index 0000000000..88752fad88
+--- /dev/null
++++ b/tests/gtest/include/test_bgp_ls_edge_update.h
+@@ -0,0 +1,119 @@
++#ifndef TEST_BGP_LS_EDGE_UPDATE_H
++#define TEST_BGP_LS_EDGE_UPDATE_H
++
++#include <gtest/gtest.h>
++#include <netinet/in.h>
++
++#include "common_data.h"
++
++/**
++ * Hacky solution to compiling with C++ (keyword delete cannot be used as a
++ * variable name); see https://stackoverflow.com/a/25647229
++ */
++#define delete to_delete
++#include "lib/link_state.h"
++#undef delete
++
++namespace Model {
++
++class EdgeTest : public testing::TestWithParam<TestCase> {
++ protected:
++  /**
++   * @brief Checks that FRR's BGP daemon is actively running and the BGP-LS TED
++   * is empty.
++   */
++  virtual void SetUp() override;
++
++  /**
++   * @brief Clears the BGP instance's link-state TED.
++   *
++   * Most of the work is done inside `bridge_clear_bgp_ls_ted()` within
++   * frr_bridge.h. This function simply acts as a C++ wrapper around the
++   * bridge's C implementation.
++   */
++  virtual void TearDown() override;
++
++  /**
++   * @brief Converts a `LinkStateNodeId` to FRR's `ls_node_id`.
++   *
++   * Defaults to `ISIS_L1` for node origin and `.iso.level`. Checks the passed
++   * `nodeId` for a valid ISO sys ID; fails the current test run if not valid.
++   * Otherwise, populates the `.iso.sys_id` field within `frrNodeId`.
++   *
++   * @param nodeId          Link-state node ID provided by the current
++   *                            `TestCase`.
++   * @param frrNodeId       FRR link-state node ID to be populated with the ISO
++   *                            sys ID from `nodeId`.
++   */
++  void NodeIdToFrr(const LinkStateNodeId& nodeId, ls_node_id& frrNodeId) const;
++
++  /**
++   * @brief Converts `LinkStateAttributes` to FRR's `ls_attributes`.
++   *
++   * Dynamically allocates `ls_attributes` at the address of `frrAttr`. This
++   * requires that the local address in `attr` is not unspecified; otherwise,
++   * FRR assigns it a null pointer. Callers are expected to manage the memory
++   * allocated by this function.
++   *
++   * Checks both the local and remote addresses in `attr` for valid IPv6
++   * addresses; fails the current test run if at least one of them is not valid.
++   * Otherwise, populates the `frrAttr` and sets its flags.
++   *
++   * @param attr        Link-state attributes provided by the current
++   *                        `TestCase`.
++   * @param adv         FRR link-state node ID to be assigned as the advertising
++   *                        node.
++   * @param frrAttr     FRR link-state attributes to be populated with
++   *                        corresponding fields in `attr`.
++   */
++  void AttributesToFrr(const LinkStateAttributes& attr, const ls_node_id& adv,
++                       ls_attributes*& frrAttr) const;
++
++  /**
++   * @brief Sends a `ls_node` with type `event` to the BGP daemon.
++   *
++   * Uses FRR's `stream` data structure to deliver the `node` information.
++   *
++   * @param node      FRR link-state node to send to the BGP daemon.
++   * @param event     Link-state message event type.
++   */
++  void SendNodeMessage(const ls_node& node, BEvent event) const;
++
++  /**
++   * @brief Sends `ls_attributes` with type `event` to the BGP daemon.
++   *
++   * Uses FRR's `stream` data structure to deliver the `attr` information. Note
++   * that `ls_attributes` messages include a field for storing the remote node
++   * as a `ls_node_id`. This function includes an option to send `attr` in
++   * reverse (switching the advertising/local node with the remote node).
++   *
++   * @param attr            FRR link-state attributes to send to the BGP daemon.
++   * @param remoteNodeId    FRR link-state node ID to be appended to the message
++   *                            as the remote node.
++   * @param event           Link-state message event type.
++   * @param reverse         If true, sends `attr` in reverse; otherwise, sends
++   *                            `attr` as a forward edge. Defaults to false.
++   */
++  void SendAttributesMessage(const ls_attributes& attr,
++                             const ls_node_id& remoteNodeId, BEvent event,
++                             bool reverse = false) const;
++
++  /**
++   * @brief Sends messages to the BGP daemon for edge updates.
++   *
++   * Internally calls `SendNodeMessage` for both the local and remote endpoints
++   * of an edge and `SendAttributesMessage` for the forward and reverse
++   * directions of an edge. Delegates FRR primitives construction and allocation
++   * to `NodeIdToFRR` and `AttributesToFrr`.
++   *
++   * @param apiMessage      `UPDATE` message specified by the current
++   *                            `TestCase`.
++   * @param attr            FRR link-state attributes to allocate. Managed by
++   *                            the caller of this function.
++   */
++  void SendUpdateMessage(const BApiLinkStateUpdate& apiMessage,
++                         ls_attributes*& attr) const;
++};
++}  // namespace Model
++
++#endif  // TEST_BGP_LS_EDGE_UPDATE_H
+diff --git a/tests/gtest/include/utils.hpp b/tests/gtest/include/utils.hpp
+new file mode 100644
+index 0000000000..6697617c76
+--- /dev/null
++++ b/tests/gtest/include/utils.hpp
+@@ -0,0 +1,78 @@
++#ifndef UTILS_HPP
++#define UTILS_HPP
++
++#include <arpa/inet.h>
++#include <netinet/in.h>
++
++#include <cctype>
++#include <cstdint>
++#include <cstdlib>
++#include <cstring>
++
++static constexpr int ISIS_SYS_ID_LEN = 6;
++
++namespace Model {
++
++/**
++ * @brief Converts the string representation of an ISO sys ID to a canonical
++ * form.
++ *
++ * Copied from `isisd/isis_misc.h` to avoid statically linking against
++ * `libisis.a`.
++ */
++inline int SysIdToBuffer(uint8_t* buff, const char* dotted) {
++  // string length must  be 14 characters
++  if (strlen(dotted) != 14) {
++    return 0;
++  }
++
++  int len = 0;
++  const char* pos = dotted;
++  uint8_t number[3];
++  number[2] = '\0';
++
++  while (len < ISIS_SYS_ID_LEN) {
++    if (*pos == '.') {
++      // period not positioned correctly
++      if (((pos - dotted) != 4) && ((pos - dotted) != 9)) {
++        len = 0;
++        break;
++      }
++      pos++;
++      continue;
++    }
++    if ((isxdigit((unsigned char)*pos)) &&
++        (isxdigit((unsigned char)*(pos + 1)))) {
++      memcpy(number, pos, 2);
++      pos += 2;
++    } else {
++      len = 0;
++      break;
++    }
++
++    *(buff + len) = (char)strtol((char*)number, NULL, 16);
++    len++;
++  }
++
++  return len;
++}
++
++/**
++ * @brief Checks if the string representation of an IPv6 address is an
++ * unspecified address.
++ */
++inline bool IsIpv6Unspecified(const char* ipStr) {
++  if (ipStr == nullptr) {
++    return false;
++  }
++
++  struct in6_addr addr;
++  if (inet_pton(AF_INET6, ipStr, &addr) == 1) {
++    return IN6_IS_ADDR_UNSPECIFIED(&addr);
++  }
++  return false;
++}
++
++}  // namespace Model
++
++#endif  // UTILS_HPP
+diff --git a/tests/gtest/src/common_data.cpp b/tests/gtest/src/common_data.cpp
+new file mode 100644
+index 0000000000..e3e1fb2715
+--- /dev/null
++++ b/tests/gtest/src/common_data.cpp
+@@ -0,0 +1,15 @@
++#include "common_data.h"
++
++namespace Model {
++
++LinkStateEdge::operator BApiLinkStateUpdate() const {
++  BApiLinkStateUpdate message{.event = BEvent::UPDATE,
++                              .remote = this->destination_node,
++                              .data = {.adv = this->source_node,
++                                       .metric = 0,
++                                       .local = this->source,
++                                       .remote = this->destination}};
++  return message;
++}
++
++}  // namespace Model
+diff --git a/tests/gtest/src/frr_bridge.c b/tests/gtest/src/frr_bridge.c
+index 30abc0a0e5..68cac5a8c5 100644
+--- a/tests/gtest/src/frr_bridge.c
++++ b/tests/gtest/src/frr_bridge.c
+@@ -159,29 +159,70 @@ static const char *edge_key_to_text(struct ls_edge_key key) {
+   return rv;
+ }
+ 
++static const char *const status2txt[] = {"Unknown", "New",  "Update",
++                                         "Delete",  "Sync", "Orphan"};
++
+ static const char *const origin2txt[] = {"Unknown", "ISIS_L1", "ISIS_L2",
+                                          "OSPFv2",  "Direct",  "Static"};
+ 
++static void vertex_to_text(const struct ls_vertex *const vertex,
++                           struct sbuf *sbuf) {
++  struct ls_node *lsn = vertex->node;
++  sbuf_push(sbuf, 2, "Vertex (%" PRIu64 "): %s", vertex->key, lsn->name);
++  sbuf_push(sbuf, 0, "\tRouter Id: %pI4", &lsn->router_id);
++  sbuf_push(sbuf, 0, "\tOrigin: %s", origin2txt[lsn->adv.origin]);
++  sbuf_push(sbuf, 0, "\tStatus: %s\n", status2txt[vertex->status]);
++  sbuf_push(sbuf, 0, "\t%d Outgoing Edges, %d Incoming Edges, %d Subnets\n",
++            listcount(vertex->outgoing_edges),
++            listcount(vertex->incoming_edges), listcount(vertex->prefixes));
++}
++
++/**
++ * from ls_show_edge_vty (lib/link_state.c, lines 2463-2637)
++ */
++static void edge_to_text(const struct ls_edge *const edge, struct sbuf *sbuf) {
++  struct ls_attributes *attr = edge->attributes;
++  char buf[INET6_BUFSIZ];
++
++  sbuf_push(sbuf, 2, "Edge (%s): ", edge_key_to_text(edge->key));
++  sbuf_push(sbuf, 0, "%pI6", &attr->standard.local6);
++  ls_node_id_to_text(attr->adv, buf, INET6_BUFSIZ);
++  sbuf_push(sbuf, 0, "\tAdv. Vertex: %s", buf);
++  sbuf_push(sbuf, 0, "\tMetric: %u", attr->metric);
++  sbuf_push(sbuf, 4, "Origin: %s\n", origin2txt[attr->adv.origin]);
++
++  sbuf_push(sbuf, 4, "Local IPv6 address: %pI6\n", &attr->standard.local6);
++  sbuf_push(sbuf, 4, "Remote IPv6 address: %pI6\n", &attr->standard.remote6);
++}
++
+ void bridge_show_ted(struct sbuf *sbuf) {
++  struct ls_vertex *vertex;
++  frr_each(vertices, &bgp->ls_info->ted->vertices, vertex) {
++    if (!vertex) {
++      continue;
++    }
++    vertex_to_text(vertex, sbuf);
++  }
++
+   struct ls_edge *edge;
+   frr_each(edges, &bgp->ls_info->ted->edges, edge) {
+     if (!edge) {
+       continue;
+     }
++    edge_to_text(edge, sbuf);
++  }
++}
+ 
+-    // from ls_show_edge_vty (lib/link_state.c, lines 2463-2637)
+-
+-    struct ls_attributes *attr = edge->attributes;
+-    char buf[INET6_BUFSIZ];
++bool bridge_edge_exists_ted(struct ls_attributes *attr) {
++  struct ls_edge *src_edge = ls_find_edge_by_source(bgp->ls_info->ted, attr);
++  struct ls_edge *dst_edge =
++      ls_find_edge_by_destination(bgp->ls_info->ted, attr);
+ 
+-    sbuf_push(sbuf, 2, "Edge (%s): ", edge_key_to_text(edge->key));
+-    sbuf_push(sbuf, 0, "%pI6", &attr->standard.local6);
+-    ls_node_id_to_text(attr->adv, buf, INET6_BUFSIZ);
+-    sbuf_push(sbuf, 0, "\tAdv. Vertex: %s", buf);
+-    sbuf_push(sbuf, 0, "\tMetric: %u", attr->metric);
+-    sbuf_push(sbuf, 4, "Origin: %s\n", origin2txt[attr->adv.origin]);
++  // NOTE: we do not need to free src_edge or dst_edge; these are essentially
++  // the raw pointers from the TED, NOT copies, which will be cleaned up during
++  // test `TearDown`.
+ 
+-    sbuf_push(sbuf, 4, "Local IPv6 address: %pI6\n", &attr->standard.local6);
+-    sbuf_push(sbuf, 4, "Remote IPv6 address: %pI6\n", &attr->standard.remote6);
+-  }
++  return src_edge != NULL && dst_edge != NULL &&
++         ls_vertex_same(src_edge->source, dst_edge->destination) &&
++         ls_vertex_same(src_edge->destination, dst_edge->source);
+ }
+diff --git a/tests/gtest/src/test_bgp_ls_edge_update.cpp b/tests/gtest/src/test_bgp_ls_edge_update.cpp
+index ed05d48cd6..7788028e85 100644
+--- a/tests/gtest/src/test_bgp_ls_edge_update.cpp
++++ b/tests/gtest/src/test_bgp_ls_edge_update.cpp
+@@ -1,6 +1,6 @@
++#include "test_bgp_ls_edge_update.h"
++
+ #include <arpa/inet.h>
+-#include <gtest/gtest.h>
+-#include <netinet/in.h>
+ 
+ #include <algorithm>
+ #include <cctype>
+@@ -8,206 +8,162 @@
+ #include <fstream>
+ #include <nlohmann/json.hpp>
+ 
+-#include "common_data.h"
+ #include "frr_bridge.h"
+-
+-// some FRR headers (mainly lib/ headers) already include guards for C++
+-
+-/**
+- * Hacky solution to compiling with C++ (keyword delete cannot be used as a
+- * variable name); see https://stackoverflow.com/a/25647229
+- */
+-#define delete to_delete
+-#include "lib/link_state.h"
+-#undef delete
+-
+ #include "lib/stream.h"
+ #include "lib/zclient.h"
+ #include "sbuf.h"
+-
+-#define ISIS_SYS_ID_LEN 6
++#include "utils.hpp"
+ 
+ namespace Model {
+ 
+-class EdgeTest : public testing::TestWithParam<TestCase> {
+- protected:
+-  void SetUp() override {
+-    // TODO
+-  }
+-
+-  void TearDown() override { bridge_clear_bgp_ls_ted(); }
+-
+-  int sysid2buff(uint8_t* buff, const char* dotted) {
+-    int len = 0;
+-    const char* pos = dotted;
+-    uint8_t number[3];
+-
+-    number[2] = '\0';
+-    // surely not a sysid_string if not 14 length
+-    if (strlen(dotted) != 14) {
+-      return 0;
+-    }
+-
+-    while (len < ISIS_SYS_ID_LEN) {
+-      if (*pos == '.') {
+-        /* the . is not positioned correctly */
+-        if (((pos - dotted) != 4) && ((pos - dotted) != 9)) {
+-          len = 0;
+-          break;
+-        }
+-        pos++;
+-        continue;
+-      }
+-      if ((isxdigit((unsigned char)*pos)) &&
+-          (isxdigit((unsigned char)*(pos + 1)))) {
+-        memcpy(number, pos, 2);
+-        pos += 2;
+-      } else {
+-        len = 0;
+-        break;
+-      }
+-
+-      *(buff + len) = (char)strtol((char*)number, NULL, 16);
+-      len++;
+-    }
+-
+-    return len;
+-  }
+-};
+-
+-TEST_P(EdgeTest, ValidateEdgeUpdate) {
+-  // Arrange
+-  TestCase tc = GetParam();
+-
+-  // Note that for arrange, we also want to place TED entries before the one
+-  // we actually want to test
++void EdgeTest::SetUp() {
++  // TODO
++}
+ 
+-  // TODO model may have IS-IS level as a free variable to test for IS-IS
+-  // interoperability between level 1 and level 2 nodes (specifically 1/2
+-  // nodes); check this again in the future
+-  struct ls_node_id remote_node_id = {.origin = ls_origin::ISIS_L1,
+-                                      .id = {.iso = {.level = 1}}};
+-  int ret = sysid2buff(remote_node_id.id.iso.sys_id,
+-                       tc.api_param.remote.iso_sys_id.c_str());
+-  ASSERT_EQ(ISIS_SYS_ID_LEN, ret)
+-      << "[sys_id]: remote node ID must be a valid ISO system identifier.";
++void EdgeTest::TearDown() { bridge_clear_bgp_ls_ted(); }
+ 
+-  // TODO same as remote node - see above
+-  struct ls_node_id adv_node_id = {.origin = ls_origin::ISIS_L1,
+-                                   .id = {.iso = {.level = 1}}};
+-  ret = sysid2buff(adv_node_id.id.iso.sys_id,
+-                   tc.api_param.data.adv.iso_sys_id.c_str());
++void EdgeTest::NodeIdToFrr(const LinkStateNodeId& nodeId,
++                           ls_node_id& frrNodeId) const {
++  // for now, we default to IS-IS level 1
++  frrNodeId = {.origin = ls_origin::ISIS_L1, .id = {.iso = {.level = 1}}};
++  int ret = SysIdToBuffer(frrNodeId.id.iso.sys_id, nodeId.iso_sys_id.c_str());
+   ASSERT_EQ(ISIS_SYS_ID_LEN, ret)
+-      << "[sys_id]: advertising node ID must be a valid ISO system identifier.";
+-
+-  struct in_addr any = {.s_addr = INADDR_ANY};
+-  struct in6_addr local6;
+-  uint32_t local_id = 0;
+-  ret = inet_pton(AF_INET6, tc.api_param.data.local.c_str(), (void*)&local6);
++      << "[sys_id]: node ID is not a valid ISO system identifier.";
++}
+ 
+-  ASSERT_EQ(1, ret) << "[ipv6]: local address must be a valid IPv6 address.";
+-  struct ls_attributes* attr =
+-      ls_attributes_new(adv_node_id, any, local6, local_id);
++void EdgeTest::AttributesToFrr(const LinkStateAttributes& attr,
++                               const ls_node_id& adv,
++                               ls_attributes*& frrAttr) const {
++  in6_addr local{};
++  int ret = inet_pton(AF_INET6, attr.local.c_str(), (void*)&local);
+ 
+-  if (attr == nullptr) {
+-    GTEST_SKIP() << "[ls_attr]: test " << tc.test_id
+-                 << " provides no meaningful input.";
+-  }
++  ASSERT_EQ(1, ret) << "[ipv6]: address is not a valid IPv6 address.";
++  frrAttr = ls_attributes_new(adv, in_addr{}, local, 0);
+ 
+-  if (!tc.api_param.data.name.empty()) {
+-    strncpy(attr->name, tc.api_param.data.name.c_str(), MAX_NAME_LENGTH);
+-    SET_FLAG(attr->flags, LS_ATTR_NAME);
++  if (!attr.name.empty()) {
++    strncpy(frrAttr->name, attr.name.c_str(), MAX_NAME_LENGTH);
++    SET_FLAG(frrAttr->flags, LS_ATTR_NAME);
+   }
+ 
+-  attr->metric = tc.api_param.data.metric;
+-  SET_FLAG(attr->flags, LS_ATTR_METRIC);
+-
+-  struct in6_addr remote6;
+-  ret = inet_pton(AF_INET6, tc.api_param.data.remote.c_str(), (void*)&remote6);
+-  ASSERT_EQ(1, ret) << "[ipv6]: remote address must be a valid IPv6 address.";
++  frrAttr->metric = attr.metric;
++  SET_FLAG(frrAttr->flags, LS_ATTR_METRIC);
+ 
+-  attr->standard.remote6 = remote6;
+-  SET_FLAG(attr->flags, LS_ATTR_NEIGH_ADDR6);
++  in6_addr remote{};
++  ret = inet_pton(AF_INET6, attr.remote.c_str(), (void*)&remote);
++  ASSERT_EQ(1, ret) << "[ipv6]: remote address is not a valid IPv6 address.";
+ 
+-  struct ls_node* remote_node = ls_node_new(remote_node_id, any, remote6);
+-  struct ls_node* adv_node = ls_node_new(adv_node_id, any, local6);
+-
+-  struct stream* bgpd_stream = stream_new(ZEBRA_MAX_PACKET_SIZ);
++  frrAttr->standard.remote6 = remote;
++  SET_FLAG(frrAttr->flags, LS_ATTR_NEIGH_ADDR6);
++}
+ 
+-  struct ls_message remote_msg = {
+-      .event = static_cast<uint8_t>(tc.api_param.event),
+-      .type = LS_MSG_TYPE_NODE,
+-      .data = {.node = remote_node}};
++void EdgeTest::SendNodeMessage(const ls_node& node, BEvent event) const {
++  stream* s = stream_new(ZEBRA_MAX_PACKET_SIZ);
+ 
+   // from ls_format_msg (lib/link_state.c, lines 1771, 1794)
+-  stream_putc(bgpd_stream, static_cast<uint8_t>(tc.api_param.event));
+-  stream_putc(bgpd_stream, LS_MSG_TYPE_NODE);
++  stream_putc(s, static_cast<uint8_t>(event));
++  stream_putc(s, LS_MSG_TYPE_NODE);
+ 
+   // from ls_format_node (lib/link_state.c, lines 1532-1580)
+-  stream_put(bgpd_stream, &remote_node->adv, sizeof(struct ls_node_id));
+-  stream_putw(bgpd_stream, remote_node->flags);
++  stream_put(s, &node.adv, sizeof(struct ls_node_id));
++  stream_putw(s, node.flags);
+ 
+-  stream_put(bgpd_stream, &remote_node->router_id6, IPV6_MAX_BYTELEN);
++  stream_put(s, &node.router_id6, IPV6_MAX_BYTELEN);
+ 
+-  bridge_send_message(bgpd_stream, zapi_opaque_registry::LINK_STATE_UPDATE);
++  bridge_send_message(s, zapi_opaque_registry::LINK_STATE_UPDATE);
++  stream_free(s);
++}
+ 
+-  stream_reset(bgpd_stream);
++void EdgeTest::SendAttributesMessage(const ls_attributes& attr,
++                                     const ls_node_id& remoteNodeId,
++                                     BEvent event, bool reverse) const {
++  stream* s = stream_new(ZEBRA_MAX_PACKET_SIZ);
+ 
+-  struct ls_message adv_msg = {
+-      .event = static_cast<uint8_t>(tc.api_param.event),
+-      .type = LS_MSG_TYPE_NODE,
+-      .data = {.node = adv_node}};
++  stream_putc(s, static_cast<uint8_t>(event));
++  stream_putc(s, LS_MSG_TYPE_ATTRIBUTES);
+ 
+-  // same as remote_node
++  if (reverse) {
++    stream_put(s, (void*)&attr.adv, sizeof(ls_node_id));
++    stream_put(s, (void*)&remoteNodeId, sizeof(ls_node_id));
++  } else {
++    stream_put(s, (void*)&remoteNodeId, sizeof(ls_node_id));
++    stream_put(s, (void*)&attr.adv, sizeof(ls_node_id));
++  }
+ 
+-  // from ls_format_msg (lib/link_state.c, lines 1771, 1794)
+-  stream_putc(bgpd_stream, static_cast<uint8_t>(tc.api_param.event));
+-  stream_putc(bgpd_stream, LS_MSG_TYPE_NODE);
++  stream_putl(s, attr.flags);
+ 
+-  // from ls_format_node (lib/link_state.c, lines 1532-1580)
+-  stream_put(bgpd_stream, &adv_node->adv, sizeof(struct ls_node_id));
+-  stream_putw(bgpd_stream, adv_node->flags);
++  if (CHECK_FLAG(attr.flags, LS_ATTR_NAME)) {
++    size_t len = strlen(attr.name);
++    stream_putc(s, len + 1);
++    stream_put(s, (void*)attr.name, len);
++    stream_putc(s, '\0');
++  }
+ 
+-  stream_put(bgpd_stream, &adv_node->router_id6, IPV6_MAX_BYTELEN);
++  stream_putl(s, attr.metric);
+ 
+-  bridge_send_message(bgpd_stream, zapi_opaque_registry::LINK_STATE_UPDATE);
++  if (reverse) {
++    stream_put(s, (void*)&attr.standard.remote6, IPV6_MAX_BYTELEN);
++    stream_put(s, (void*)&attr.standard.local6, IPV6_MAX_BYTELEN);
++  } else {
++    stream_put(s, (void*)&attr.standard.local6, IPV6_MAX_BYTELEN);
++    stream_put(s, (void*)&attr.standard.remote6, IPV6_MAX_BYTELEN);
++  }
+ 
+-  stream_reset(bgpd_stream);
++  bridge_send_message(s, zapi_opaque_registry::LINK_STATE_UPDATE);
++  stream_free(s);
++}
+ 
+-  struct ls_message edge_msg = {
+-      .event = static_cast<uint8_t>(tc.api_param.event),
+-      .type = LS_MSG_TYPE_ATTRIBUTES,
+-      .remote_id = remote_node_id,
+-      .data = {.attr = attr}};
++void EdgeTest::SendUpdateMessage(const BApiLinkStateUpdate& apiMessage,
++                                 ls_attributes*& attr) const {
++  // TODO model may have IS-IS level as a free variable to test for IS-IS
++  // interoperability between level 1 and level 2 nodes (specifically 1/2
++  // nodes); check this again in the future
++  ls_node_id remote_node_id{};
++  NodeIdToFrr(apiMessage.remote, remote_node_id);
+ 
+-  // see lib/link_state.c, lines 1836-1842 (entry point)
++  // TODO same as remote node - see above
++  ls_node_id adv_node_id{};
++  NodeIdToFrr(apiMessage.data.adv, adv_node_id);
+ 
+-  // from ls_format_msg (lib/link_state.c, lines 1771-1794)
+-  stream_putc(bgpd_stream, static_cast<uint8_t>(tc.api_param.event));
+-  stream_putc(bgpd_stream, LS_MSG_TYPE_ATTRIBUTES);
++  AttributesToFrr(apiMessage.data, adv_node_id, attr);
+ 
+-  stream_put(bgpd_stream, (void*)&remote_node_id, sizeof(struct ls_node_id));
++  struct ls_node* remote_node =
++      ls_node_new(remote_node_id, in_addr{}, attr->standard.remote6);
++  SendNodeMessage(*remote_node, apiMessage.event);
+ 
+-  // from ls_format_attributes (lib/link_state.c, lines 1582-1725)
+-  size_t len;
++  struct ls_node* adv_node =
++      ls_node_new(adv_node_id, in_addr{}, attr->standard.local6);
++  SendNodeMessage(*adv_node, apiMessage.event);
+ 
+-  stream_put(bgpd_stream, &attr->adv, sizeof(struct ls_node_id));
++  SendAttributesMessage(*attr, remote_node_id, apiMessage.event);  // forward
++  SendAttributesMessage(*attr, remote_node_id, apiMessage.event,
++                        true);  // reverse
+ 
+-  stream_putl(bgpd_stream, attr->flags);
++  ls_node_del(adv_node);
++  ls_node_del(remote_node);
++}
+ 
+-  if (CHECK_FLAG(attr->flags, LS_ATTR_NAME)) {
+-    len = strlen(attr->name);
+-    stream_putc(bgpd_stream, len + 1);
+-    stream_put(bgpd_stream, attr->name, len);
+-    stream_putc(bgpd_stream, '\0');
++TEST_P(EdgeTest, ValidateEdgeUpdate) {
++  // Arrange
++  TestCase tc = GetParam();
++
++  if (IsIpv6Unspecified(tc.api_param.data.local.c_str()) ||
++      IsIpv6Unspecified(tc.api_param.data.remote.c_str())) {
++    GTEST_SKIP() << "[ls_attr]: test " << tc.test_id
++                 << " provides no meaningful input.";
+   }
+ 
+-  stream_putl(bgpd_stream, attr->metric);
+-  stream_put(bgpd_stream, &attr->standard.local6, IPV6_MAX_BYTELEN);
+-  stream_put(bgpd_stream, &attr->standard.remote6, IPV6_MAX_BYTELEN);
++  // Note that for arrange, we also want to place TED entries before the one
++  // we actually want to test
++  for (const auto& edge : tc.initial_state.ted) {
++    ls_attributes* tempAttr;
++    BApiLinkStateUpdate message = static_cast<BApiLinkStateUpdate>(edge);
++    SendUpdateMessage(message, tempAttr);
++    ls_attributes_del(tempAttr);
++  }
+ 
+   // Act
+-  bridge_send_message(bgpd_stream, zapi_opaque_registry::LINK_STATE_UPDATE);
++  ls_attributes* attr;
++  SendUpdateMessage(tc.api_param, attr);
+ 
+   // Debug
+   struct sbuf sbuf;
+@@ -217,16 +173,12 @@ TEST_P(EdgeTest, ValidateEdgeUpdate) {
+   std::cout << sbuf_buf(&sbuf) << std::endl;
+ 
+   // Assert
+-  // TODO implement assertion to check if the TED has two-way direction
+-  // installed, as well as the RIB
+-  ASSERT_NE(tc.test_id, 0);
++  ASSERT_TRUE(bridge_edge_exists_ted(attr))
++      << "[ls_attributes]: edge does not exist within TED.";
+ 
+   // Clean
+   sbuf_free(&sbuf);
+-  ls_node_del(adv_node);
+-  ls_node_del(remote_node);
+   ls_attributes_del(attr);
+-  stream_free(bgpd_stream);
+ }
+ 
+ // supplies a custom ID generator based on the TestId field in JSON
+-- 
+2.34.1
+

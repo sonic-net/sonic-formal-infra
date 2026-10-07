@@ -1,0 +1,712 @@
+From 71e2beb9339aa816167d9e7b4a0c7b1d64891410 Mon Sep 17 00:00:00 2001
+From: Gabe Lapingcao <mgultra2018@gmail.com>
+Date: Thu, 16 Jul 2026 12:28:36 -0700
+Subject: [PATCH 05/14] [tests/gtest]: refactor FRR bridge to minimum bgpd
+ configuration
+
+Trims environment initialization of bgpd to run single-threaded within
+the test executable.
+
+Signed-off-by: Gabe Lapingcao <mgultra2018@gmail.com>
+---
+ tests/gtest/CMakeLists.txt                  |   1 +
+ tests/gtest/include/common_data.h           |  13 +
+ tests/gtest/include/frr_bridge.h            |  23 ++
+ tests/gtest/src/frr_bridge.c                | 428 +++++---------------
+ tests/gtest/src/test_bgp_ls_edge_update.cpp |  68 +++-
+ 5 files changed, 204 insertions(+), 329 deletions(-)
+
+diff --git a/tests/gtest/CMakeLists.txt b/tests/gtest/CMakeLists.txt
+index c411c8da0c..eb549e4e00 100644
+--- a/tests/gtest/CMakeLists.txt
++++ b/tests/gtest/CMakeLists.txt
+@@ -56,6 +56,7 @@ add_executable(model_tests
+     "src/test_bgp_ls_edge_update.cpp" 
+ 
+     "src/frr_bridge.c"
++    "src/sbuf.c"                        # used to print logs opposed to lib/sbuf.h
+ )
+ 
+ set_target_properties(model_tests PROPERTIES POSITION_INDEPENDENT_CODE OFF)
+diff --git a/tests/gtest/include/common_data.h b/tests/gtest/include/common_data.h
+index 7fff76acfe..0a6a04137d 100644
+--- a/tests/gtest/include/common_data.h
++++ b/tests/gtest/include/common_data.h
+@@ -187,6 +187,19 @@ inline void from_json(const nlohmann::json& j, TestCase& tc) {
+  */
+ inline std::vector<TestCase> testCases;
+ 
++/**
++ * @brief Prints information about `TestCase` instances.
++ *
++ * Google Test relies on this function to print information about test runs. If
++ * this function isn't defined, Valgrind will complain about "uninitialized
++ * values" and "conditional jumps relying on uninitialized values". Note that
++ * `AbslStringify` is an alternative function that Google Test uses in the same
++ * manner.
++ */
++inline void PrintTo(const TestCase& tc, std::ostream* os) {
++  *os << "{ ID: " << tc.test_id << ", Op: " << tc.op << " }";
++}
++
+ }  // namespace Model
+ 
+ #endif  // COMMON_DATA_H
+diff --git a/tests/gtest/include/frr_bridge.h b/tests/gtest/include/frr_bridge.h
+index 8c00f5352e..d4b88a172d 100644
+--- a/tests/gtest/include/frr_bridge.h
++++ b/tests/gtest/include/frr_bridge.h
+@@ -2,6 +2,7 @@
+ #define FRR_BRIDGE_H
+ 
+ #include "lib/stream.h"
++#include "sbuf.h"  // modified version of lib/sbuf.h
+ 
+ #ifdef __cplusplus
+ extern "C" {
+@@ -9,11 +10,28 @@ extern "C" {
+ 
+ /**
+  * @brief Initializes FRR's BGP daemon along with a single BGP routing instance.
++ *
++ * The configuration specified by this function is bare-bones, allowing for
++ * testing of BGP and BGP-LS without requiring a Zebra instance or an IGP daemon
++ * to be running at the same time. It may be extended in the future for testing
++ * with pthreads enabled.
+  */
+ void bridge_init_bgp(void);
+ 
++/**
++ * @brief Clears the BGP instance's link-state TED.
++ *
++ * This function is called on `TearDown` after each model test case. Note that
++ * FRR states that the RIB is also cleared during the function call to
++ * `bgp_ls_withdraw_ted`, specifically only for BGP-LS locally originated paths.
++ */
++void bridge_clear_bgp_ls_ted(void);
++
+ /**
+  * @brief Cleans the running BGP daemon along with any BGP routing instances.
++ *
++ * This function only needs to terminate all running BGP instances before the
++ * daemon is shutdown.
+  */
+ void bridge_clean_bgp(void);
+ 
+@@ -26,6 +44,11 @@ void bridge_clean_bgp(void);
+  */
+ void bridge_send_message(struct stream* s, uint8_t msg_type);
+ 
++/**
++ * @brief Pushes BGP-LS's TED to a string buffer for debugging.
++ */
++void bridge_show_ted(struct sbuf* sbuf);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/tests/gtest/src/frr_bridge.c b/tests/gtest/src/frr_bridge.c
+index f60b11b0e8..30abc0a0e5 100644
+--- a/tests/gtest/src/frr_bridge.c
++++ b/tests/gtest/src/frr_bridge.c
+@@ -1,76 +1,55 @@
+ #include "frr_bridge.h"
+ 
+ // clang-format off
++#include <stdlib.h>
+ #include <zebra.h>
+ 
+-#include <pthread.h>
+-#include "vector.h"
+-#include "command.h"
+-#include "getopt.h"
+-#include "frrevent.h"
+-#include <lib/version.h>
+-#include "memory.h"
+-#include "prefix.h"
+-#include "log.h"
+-#include "privs.h"
+-#include "sigevent.h"
+-#include "zclient.h"
+-#include "routemap.h"
+-#include "filter.h"
+-#include "plist.h"
+-#include "stream.h"
+-#include "queue.h"
+-#include "vrf.h"
+-#include "bfd.h"
+-#include "libfrr.h"
+-#include "ns.h"
+-#include "libagentx.h"
+-#include <string.h>
+-#include <sys/stat.h>
++#include "lib/asn.h"
++#include "lib/bfd.h"
++#include "lib/compiler.h"
++#include "lib/frrevent.h"
++#include "lib/libfrr.h"
++#include "lib/linklist.h"
++#include "lib/log_vty.h"
++#include "lib/northbound.h"
++#include "lib/privs.h"
++#include "lib/qobj.h"
++#include "lib/sigevent.h"
++#include "lib/typesafe.h"
++#include "lib/version.h"
++#include "lib/vrf.h"
++#include "lib/zlog.h"
+ 
+ #include "bgpd/bgpd.h"
+ #include "bgpd/bgp_attr.h"
+-#include "bgpd/bgp_route.h"
+-#include "bgpd/bgp_mplsvpn.h"
+-#include "bgpd/bgp_aspath.h"
+-#include "bgpd/bgp_dump.h"
+-#include "bgpd/bgp_route.h"
+-#include "bgpd/bgp_nexthop.h"
+-#include "bgpd/bgp_regex.h"
+-#include "bgpd/bgp_clist.h"
+-#include "bgpd/bgp_debug.h"
+-#include "bgpd/bgp_errors.h"
+-#include "bgpd/bgp_filter.h"
+-#include "bgpd/bgp_zebra.h"
+-#include "bgpd/bgp_packet.h"
+-#include "bgpd/bgp_keepalives.h"
++#include "bgpd/bgp_ls.h"
++#include "bgpd/bgp_ls_nlri.h"
++#include "bgpd/bgp_ls_ted.h"
+ #include "bgpd/bgp_network.h"
+-#include "bgpd/bgp_errors.h"
+-#include "bgpd/bgp_evpn_mh.h"
+-#include "bgpd/bgp_nhg.h"
+ #include "bgpd/bgp_routemap_nb.h"
+-#include "bgpd/bgp_community_alias.h"
+-
+-#include "bgpd/bgp_ls_ted.h"
++#include "bgpd/bgp_vty.h"
+ // clang-format on
+ 
+-DEFINE_HOOK(bgp_hook_config_write_vrf, (struct vty * vty, struct vrf *vrf),
+-            (vty, vrf));
+-
+-#ifdef ENABLE_BGP_VNC
+-#include "bgpd/rfapi/rfapi_backend.h"
+-#endif
++/**
++ * The BGP instance to initialize in bgpd. Note that because this is declared as
++ * static, teardown of this memory isn't necessary as the operating system will
++ * automatically clean this up for us. In Valgrind, the memory pointed to by
++ * this pointer will be considered "still reachable".
++ */
++static struct bgp *bgp = NULL;
+ 
+-DEFINE_HOOK(bgp_hook_vrf_update, (struct vrf * vrf, bool enabled),
+-            (vrf, enabled));
++/**
++ * The Autonomous System number assigned to the BGP instance running in bgpd.
++ */
++static as_t asn = 100;
+ 
+ void sighup(void);
+ void sigint(void);
+ void sigusr1(void);
+ 
+-static void bgp_exit(int);
+-static void bgp_vrf_terminate(void);
+-
++/**
++ * Signal handlers.
++ */
+ static struct frr_signal_t bgp_signals[] = {
+     {
+         .signal = SIGHUP,
+@@ -93,227 +72,19 @@ static struct frr_signal_t bgp_signals[] = {
+ // mimics skip runas CLI option
+ struct zebra_privs_t bgpd_privs = {0};
+ 
+-static struct frr_daemon_info bgpd_di;
+-
+ void sighup(void) { zlog_info("SIGHUP received, ignoring"); }
+ 
+ FRR_NORETURN void sigint(void) {
+   zlog_notice("Terminating on signal");
+   assert(bm->terminating == false);
+   bm->terminating = true;
+-
+   bfd_protocol_integration_set_shutdown(true);
+-
+   bgp_terminate();
+-
+-  bgp_exit(0);
+-
+-  peer_connection_fifo_fini(&bm->connection_fifo);
+-  event_cancel(&bm->e_process_packet);
+-  pthread_mutex_destroy(&bm->peer_connection_mtx);
+-
+-  exit(0);
++  exit(EXIT_SUCCESS);
+ }
+ 
+ void sigusr1(void) { zlog_rotate(); }
+ 
+-static void bgp_exit(int status) {
+-  struct bgp *bgp, *bgp_default, *bgp_evpn;
+-  struct listnode *node, *nnode;
+-
+-  assert(status == 0);
+-
+-  frr_early_fini();
+-
+-  bgp_close();
+-
+-  bgp_default = bgp_get_default();
+-  bgp_evpn = bgp_get_evpn();
+-
+-  bgp_lp_release_pending_lu_locks();
+-
+-  /* reverse bgp_master_init */
+-  for (ALL_LIST_ELEMENTS(bm->bgp, node, nnode, bgp)) {
+-    if (bgp_default == bgp || bgp_evpn == bgp) continue;
+-    bgp_delete(bgp);
+-  }
+-  if (bgp_evpn && bgp_evpn != bgp_default) bgp_delete(bgp_evpn);
+-  if (bgp_default) bgp_delete(bgp_default);
+-
+-  bgp_evpn_mh_finish();
+-  bgp_nhg_finish();
+-
+-  zebra_announce_fini(&bm->zebra_announce_head);
+-  zebra_announce_fini(&bm->zebra_announce_early_head);
+-  zebra_l2_vni_fini(&bm->zebra_l2_vni_head);
+-
+-  /* reverse bgp_dump_init */
+-  bgp_dump_finish();
+-
+-  /* BGP community aliases */
+-  bgp_community_alias_finish();
+-
+-  /* reverse bgp_route_init */
+-  bgp_route_finish();
+-
+-  /* cleanup route maps */
+-  bgp_route_map_terminate();
+-
+-  /* reverse bgp_attr_init */
+-  bgp_attr_finish();
+-
+-  /* reverse bgp_labels_init */
+-  bgp_labels_finish();
+-
+-  /* stop pthreads */
+-  bgp_pthreads_finish();
+-
+-  /* reverse access_list_init */
+-  access_list_add_hook(NULL);
+-  access_list_delete_hook(NULL);
+-  access_list_reset();
+-
+-  /* reverse bgp_filter_init */
+-  as_list_add_hook(NULL);
+-  as_list_delete_hook(NULL);
+-  bgp_filter_reset();
+-
+-  /* reverse prefix_list_init */
+-  prefix_list_add_hook(NULL);
+-  prefix_list_delete_hook(NULL);
+-  prefix_list_reset();
+-
+-  /* reverse community_list_init */
+-  community_list_terminate(bgp_clist);
+-
+-  bgp_vrf_terminate();
+-#ifdef ENABLE_BGP_VNC
+-  vnc_zebra_destroy();
+-#endif
+-  bgp_zebra_destroy();
+-
+-  bgp_debug_destroy();
+-
+-  bf_free(bm->rd_idspace);
+-  list_delete(&bm->bgp);
+-  list_delete(&bm->addresses);
+-
+-  bgp_lp_finish();
+-
+-  memset(bm, 0, sizeof(*bm));
+-
+-  frr_fini();
+-}
+-
+-static int bgp_vrf_new(struct vrf *vrf) {
+-  if (BGP_DEBUG(zebra, ZEBRA))
+-    zlog_debug("VRF Created: %s(%u)", vrf->name, vrf->vrf_id);
+-
+-  return 0;
+-}
+-
+-static int bgp_vrf_delete(struct vrf *vrf) {
+-  if (BGP_DEBUG(zebra, ZEBRA))
+-    zlog_debug("VRF Deletion: %s(%u)", vrf->name, vrf->vrf_id);
+-
+-  return 0;
+-}
+-
+-static int bgp_vrf_enable(struct vrf *vrf) {
+-  struct bgp *bgp;
+-  vrf_id_t old_vrf_id;
+-  int ret = BGP_GR_FAILURE;
+-  (void)ret; /* for unused variable warning */
+-
+-  if (BGP_DEBUG(zebra, ZEBRA))
+-    zlog_debug("VRF enable add %s id %u", vrf->name, vrf->vrf_id);
+-
+-  bgp = bgp_lookup_by_name(vrf->name);
+-  if (bgp && bgp->vrf_id != vrf->vrf_id) {
+-    old_vrf_id = bgp->vrf_id;
+-    /* We have instance configured, link to VRF and make it "up". */
+-    bgp_vrf_link(bgp, vrf);
+-
+-    VTY_BGP_GR_ROUTER_DETECT_AND_SEND_CAPABILITY_TO_ZEBRA(bgp, bgp->peer, ret);
+-
+-    bgp_handle_socket(bgp, vrf, old_vrf_id, true);
+-    bgp_instance_up(bgp);
+-    hook_call(bgp_hook_vrf_update, vrf, true);
+-    vpn_leak_zebra_vrf_label_update(bgp, AFI_IP);
+-    vpn_leak_zebra_vrf_label_update(bgp, AFI_IP6);
+-    vpn_leak_zebra_vrf_sid_update(bgp, AFI_IP);
+-    vpn_leak_zebra_vrf_sid_update(bgp, AFI_IP6);
+-    vpn_leak_postchange(BGP_VPN_POLICY_DIR_TOVPN, AFI_IP, bgp_get_default(),
+-                        bgp);
+-    vpn_leak_postchange(BGP_VPN_POLICY_DIR_FROMVPN, AFI_IP, bgp_get_default(),
+-                        bgp);
+-    vpn_leak_postchange(BGP_VPN_POLICY_DIR_TOVPN, AFI_IP6, bgp_get_default(),
+-                        bgp);
+-    vpn_leak_postchange(BGP_VPN_POLICY_DIR_FROMVPN, AFI_IP6, bgp_get_default(),
+-                        bgp);
+-  }
+-
+-  return 0;
+-}
+-
+-static int bgp_vrf_disable(struct vrf *vrf) {
+-  struct bgp *bgp;
+-
+-  if (vrf->vrf_id == VRF_DEFAULT) return 0;
+-
+-  if (BGP_DEBUG(zebra, ZEBRA))
+-    zlog_debug("VRF disable %s id %d", vrf->name, vrf->vrf_id);
+-
+-  bgp = bgp_lookup_by_name_filter(vrf->name, false);
+-  if (bgp) {
+-    vpn_leak_zebra_vrf_label_withdraw(bgp, AFI_IP);
+-    vpn_leak_zebra_vrf_label_withdraw(bgp, AFI_IP6);
+-    vpn_leak_prechange(BGP_VPN_POLICY_DIR_TOVPN, AFI_IP, bgp_get_default(),
+-                       bgp);
+-    vpn_leak_prechange(BGP_VPN_POLICY_DIR_FROMVPN, AFI_IP, bgp_get_default(),
+-                       bgp);
+-    vpn_leak_prechange(BGP_VPN_POLICY_DIR_TOVPN, AFI_IP6, bgp_get_default(),
+-                       bgp);
+-    vpn_leak_prechange(BGP_VPN_POLICY_DIR_FROMVPN, AFI_IP6, bgp_get_default(),
+-                       bgp);
+-
+-    bgp_handle_socket(bgp, vrf, VRF_UNKNOWN, false);
+-    /* We have instance configured, unlink from VRF and make it
+-     * "down". */
+-    bgp_instance_down(bgp);
+-    bgp_vrf_unlink(bgp, vrf);
+-    hook_call(bgp_hook_vrf_update, vrf, false);
+-  }
+-
+-  /* Note: This is a callback, the VRF will be deleted by the caller. */
+-  return 0;
+-}
+-
+-static int bgp_vrf_config_write(struct vty *vty) {
+-  struct vrf *vrf;
+-
+-  RB_FOREACH(vrf, vrf_name_head, &vrfs_by_name) {
+-    if (vrf->vrf_id == VRF_DEFAULT) {
+-      vty_out(vty, "!\n");
+-      continue;
+-    }
+-    vty_out(vty, "vrf %s\n", vrf->name);
+-
+-    hook_call(bgp_hook_config_write_vrf, vty, vrf);
+-
+-    vty_out(vty, "exit-vrf\n!\n");
+-  }
+-
+-  return 0;
+-}
+-
+-static void bgp_vrf_init(void) {
+-  vrf_init(bgp_vrf_new, bgp_vrf_enable, bgp_vrf_disable, bgp_vrf_delete);
+-  vrf_cmd_init(bgp_vrf_config_write);
+-}
+-
+-static void bgp_vrf_terminate(void) { vrf_terminate(); }
+-
+ static const struct frr_yang_module_info *const bgpd_yang_modules[] = {
+     &frr_filter_info, &frr_interface_info,     &frr_route_map_info,
+     &frr_vrf_info,    &frr_bgp_route_map_info,
+@@ -326,78 +97,91 @@ FRR_DAEMON_INFO(bgpd, BGP, .vty_port = BGP_VTY_PORT,
+                 .n_yang_modules = array_size(bgpd_yang_modules), );
+ 
+ void bridge_init_bgp(void) {
+-  const char *test_dir = "/tmp/frr";
+-  mkdir(test_dir, 0777);
+-
+-  strncpy(frr_libstatedir, test_dir, 255);
+-  strncpy(frr_runstatedir, test_dir, 255);
+-
+-  int bgp_port = BGP_PORT_DEFAULT;
+-  struct list *addresses = list_new();
+-  int instance = 0;
+-  int buffer_size = BGP_SOCKET_SNDBUF_SIZE;
+-  char *address;
+-  struct listnode *node;
+-  bool v6_with_v4_nexthops = false;
+-
+-  addresses->cmp = (int (*)(void *, void *))strcmp;
+-
+-  int argc = 4;
+-  char *argv[] = {"bgpd", "-i", "/tmp/frr_test/bgpd.pid", NULL};
+-  frr_preinit(&bgpd_di, argc, argv);
++  qobj_init();
++  bgp_attr_init();
++  cmd_init(0);
++  bgp_vty_init();
++  struct event_loop *master = event_master_create(NULL);
++  bgp_master_init(master, BGP_SOCKET_SNDBUF_SIZE, list_new());
++  vrf_init(NULL, NULL, NULL, NULL);
++  bgp_option_set(BGP_OPT_NO_LISTEN);
+ 
+-  bgpd_di.limit_fds = 1000;  // mimics setting the --limit-fds option
++  bgp_get(&bgp, &asn, NULL, BGP_INSTANCE_TYPE_DEFAULT, NULL, ASNOTATION_PLAIN);
++}
+ 
+-  // bm is a a global bgp_master struct defined in bgpd/bgpd.h
+-  // we initialize it with bgp_master_init
+-  bgp_master_init(frr_init(), buffer_size, addresses);
++void bridge_clear_bgp_ls_ted(void) { bgp_ls_withdraw_ted(bgp); }
+ 
+-  bm->startup_time = monotime(NULL);
+-  bm->port = bgp_port;
+-  bm->v6_with_v4_nexthops = v6_with_v4_nexthops;
++void bridge_clean_bgp(void) {
++  assert(bm->terminating == false);
++  bm->terminating = true;
++  bfd_protocol_integration_set_shutdown(true);
++  bgp_terminate();
++}
+ 
+-  bgp_option_set(BGP_OPT_NO_LISTEN);
+-  bgp_option_set(BGP_OPT_NO_FIB);
+-  bgp_option_set(BGP_OPT_NO_ZEBRA);
++void bridge_send_message(struct stream *s, uint8_t msg_type) {
++  bgp_ls_process_linkstate_message(s, msg_type);
++}
+ 
+-  bgp_error_init();
+-  libagentx_init();
+-  bgp_vrf_init();  // TODO check if this is actually needed (static method in
+-                   // source, see bgpd/bgp_main.c)
++static const char *ls_node_id_to_text(struct ls_node_id lnid, char *str,
++                                      size_t size) {
++  if (lnid.origin == ISIS_L1 || lnid.origin == ISIS_L2)
++    snprintfrr(str, size, "%pSY", lnid.id.iso.sys_id);
++  else
++    snprintfrr(str, size, "%pI4", &lnid.id.ip.addr);
+ 
+-  bgp_init((unsigned short)instance);
++  return str;
++}
+ 
+-  if (list_isempty(bm->addresses)) {
+-    snprintf(bgpd_di.startinfo, sizeof(bgpd_di.startinfo), ", bgp@<all>:%d",
+-             bm->port);
+-  } else {
+-    for (ALL_LIST_ELEMENTS_RO(bm->addresses, node, address))
+-      snprintf(bgpd_di.startinfo + strlen(bgpd_di.startinfo),
+-               sizeof(bgpd_di.startinfo) - strlen(bgpd_di.startinfo),
+-               ", bgp@%s:%d", address, bm->port);
++static const char *edge_key_to_text(struct ls_edge_key key) {
++#define FORMAT_BUF_COUNT 4
++  static char buf_ring[FORMAT_BUF_COUNT][INET6_BUFSIZ];
++  static size_t cur_buf = 0;
++  char *rv;
++
++  rv = buf_ring[cur_buf];
++  cur_buf = (cur_buf + 1) % FORMAT_BUF_COUNT;
++
++  switch (key.family) {
++    case AF_INET:
++      snprintfrr(rv, INET6_BUFSIZ, "%pI4", &key.k.addr);
++      break;
++    case AF_INET6:
++      snprintfrr(rv, INET6_BUFSIZ, "%pI6", &key.k.addr6);
++      break;
++    case AF_LOCAL:
++      snprintfrr(rv, INET6_BUFSIZ, "%" PRIu64, key.k.link_id);
++      break;
++    default:
++      snprintfrr(rv, INET6_BUFSIZ, "(Unknown)");
++      break;
+   }
+ 
+-  bgp_if_init();
+-
+-  frr_config_fork();
+-  bgp_pthreads_run();
++  return rv;
+ }
+ 
+-void bridge_clean_bgp(void) {
+-  assert(bm->terminating == false);
+-  bm->terminating = true;
++static const char *const origin2txt[] = {"Unknown", "ISIS_L1", "ISIS_L2",
++                                         "OSPFv2",  "Direct",  "Static"};
+ 
+-  bfd_protocol_integration_set_shutdown(true);
++void bridge_show_ted(struct sbuf *sbuf) {
++  struct ls_edge *edge;
++  frr_each(edges, &bgp->ls_info->ted->edges, edge) {
++    if (!edge) {
++      continue;
++    }
+ 
+-  bgp_terminate();
++    // from ls_show_edge_vty (lib/link_state.c, lines 2463-2637)
+ 
+-  bgp_exit(0);
++    struct ls_attributes *attr = edge->attributes;
++    char buf[INET6_BUFSIZ];
+ 
+-  peer_connection_fifo_fini(&bm->connection_fifo);
+-  event_cancel(&bm->e_process_packet);
+-  pthread_mutex_destroy(&bm->peer_connection_mtx);
+-}
++    sbuf_push(sbuf, 2, "Edge (%s): ", edge_key_to_text(edge->key));
++    sbuf_push(sbuf, 0, "%pI6", &attr->standard.local6);
++    ls_node_id_to_text(attr->adv, buf, INET6_BUFSIZ);
++    sbuf_push(sbuf, 0, "\tAdv. Vertex: %s", buf);
++    sbuf_push(sbuf, 0, "\tMetric: %u", attr->metric);
++    sbuf_push(sbuf, 4, "Origin: %s\n", origin2txt[attr->adv.origin]);
+ 
+-void bridge_send_message(struct stream *s, uint8_t msg_type) {
+-  bgp_ls_process_linkstate_message(s, msg_type);
++    sbuf_push(sbuf, 4, "Local IPv6 address: %pI6\n", &attr->standard.local6);
++    sbuf_push(sbuf, 4, "Remote IPv6 address: %pI6\n", &attr->standard.remote6);
++  }
+ }
+diff --git a/tests/gtest/src/test_bgp_ls_edge_update.cpp b/tests/gtest/src/test_bgp_ls_edge_update.cpp
+index 62d71486fd..ed05d48cd6 100644
+--- a/tests/gtest/src/test_bgp_ls_edge_update.cpp
++++ b/tests/gtest/src/test_bgp_ls_edge_update.cpp
+@@ -23,6 +23,7 @@
+ 
+ #include "lib/stream.h"
+ #include "lib/zclient.h"
++#include "sbuf.h"
+ 
+ #define ISIS_SYS_ID_LEN 6
+ 
+@@ -34,9 +35,7 @@ class EdgeTest : public testing::TestWithParam<TestCase> {
+     // TODO
+   }
+ 
+-  void TearDown() override {
+-    // TODO
+-  }
++  void TearDown() override { bridge_clear_bgp_ls_ted(); }
+ 
+   int sysid2buff(uint8_t* buff, const char* dotted) {
+     int len = 0;
+@@ -130,13 +129,57 @@ TEST_P(EdgeTest, ValidateEdgeUpdate) {
+   attr->standard.remote6 = remote6;
+   SET_FLAG(attr->flags, LS_ATTR_NEIGH_ADDR6);
+ 
+-  struct ls_message msg = {.event = static_cast<uint8_t>(tc.api_param.event),
+-                           .type = LS_MSG_TYPE_ATTRIBUTES,
+-                           .remote_id = remote_node_id,
+-                           .data = {.attr = attr}};
++  struct ls_node* remote_node = ls_node_new(remote_node_id, any, remote6);
++  struct ls_node* adv_node = ls_node_new(adv_node_id, any, local6);
+ 
+   struct stream* bgpd_stream = stream_new(ZEBRA_MAX_PACKET_SIZ);
+ 
++  struct ls_message remote_msg = {
++      .event = static_cast<uint8_t>(tc.api_param.event),
++      .type = LS_MSG_TYPE_NODE,
++      .data = {.node = remote_node}};
++
++  // from ls_format_msg (lib/link_state.c, lines 1771, 1794)
++  stream_putc(bgpd_stream, static_cast<uint8_t>(tc.api_param.event));
++  stream_putc(bgpd_stream, LS_MSG_TYPE_NODE);
++
++  // from ls_format_node (lib/link_state.c, lines 1532-1580)
++  stream_put(bgpd_stream, &remote_node->adv, sizeof(struct ls_node_id));
++  stream_putw(bgpd_stream, remote_node->flags);
++
++  stream_put(bgpd_stream, &remote_node->router_id6, IPV6_MAX_BYTELEN);
++
++  bridge_send_message(bgpd_stream, zapi_opaque_registry::LINK_STATE_UPDATE);
++
++  stream_reset(bgpd_stream);
++
++  struct ls_message adv_msg = {
++      .event = static_cast<uint8_t>(tc.api_param.event),
++      .type = LS_MSG_TYPE_NODE,
++      .data = {.node = adv_node}};
++
++  // same as remote_node
++
++  // from ls_format_msg (lib/link_state.c, lines 1771, 1794)
++  stream_putc(bgpd_stream, static_cast<uint8_t>(tc.api_param.event));
++  stream_putc(bgpd_stream, LS_MSG_TYPE_NODE);
++
++  // from ls_format_node (lib/link_state.c, lines 1532-1580)
++  stream_put(bgpd_stream, &adv_node->adv, sizeof(struct ls_node_id));
++  stream_putw(bgpd_stream, adv_node->flags);
++
++  stream_put(bgpd_stream, &adv_node->router_id6, IPV6_MAX_BYTELEN);
++
++  bridge_send_message(bgpd_stream, zapi_opaque_registry::LINK_STATE_UPDATE);
++
++  stream_reset(bgpd_stream);
++
++  struct ls_message edge_msg = {
++      .event = static_cast<uint8_t>(tc.api_param.event),
++      .type = LS_MSG_TYPE_ATTRIBUTES,
++      .remote_id = remote_node_id,
++      .data = {.attr = attr}};
++
+   // see lib/link_state.c, lines 1836-1842 (entry point)
+ 
+   // from ls_format_msg (lib/link_state.c, lines 1771-1794)
+@@ -166,11 +209,22 @@ TEST_P(EdgeTest, ValidateEdgeUpdate) {
+   // Act
+   bridge_send_message(bgpd_stream, zapi_opaque_registry::LINK_STATE_UPDATE);
+ 
++  // Debug
++  struct sbuf sbuf;
++  sbuf_init(&sbuf, NULL, 0);
++
++  bridge_show_ted(&sbuf);
++  std::cout << sbuf_buf(&sbuf) << std::endl;
++
+   // Assert
+   // TODO implement assertion to check if the TED has two-way direction
+   // installed, as well as the RIB
+   ASSERT_NE(tc.test_id, 0);
+ 
++  // Clean
++  sbuf_free(&sbuf);
++  ls_node_del(adv_node);
++  ls_node_del(remote_node);
+   ls_attributes_del(attr);
+   stream_free(bgpd_stream);
+ }
+-- 
+2.34.1
+

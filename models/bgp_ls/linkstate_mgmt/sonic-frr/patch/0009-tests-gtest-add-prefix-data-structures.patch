@@ -1,0 +1,283 @@
+From 69e0a03b9231d2840b35198f43f8c04858a785a9 Mon Sep 17 00:00:00 2001
+From: Gabe Lapingcao <mgultra2018@gmail.com>
+Date: Thu, 13 Aug 2026 10:27:08 -0700
+Subject: [PATCH 09/14] [tests/gtest]: add prefix data structures
+
+Implements prefix data structures within the model's namespace along
+with JSON parsing methods and conversion methods.
+
+Signed-off-by: Gabe Lapingcao <mgultra2018@gmail.com>
+---
+ tests/gtest/include/common_data.h           | 92 +++++++++++++++++++--
+ tests/gtest/include/linkstate_data.h        | 11 ++-
+ tests/gtest/src/common_data.cpp             | 48 +++++++++--
+ tests/gtest/src/test_bgp_ls_edge_update.cpp | 10 ---
+ 4 files changed, 139 insertions(+), 22 deletions(-)
+
+diff --git a/tests/gtest/include/common_data.h b/tests/gtest/include/common_data.h
+index e29e345dc5..32b06e7ea0 100644
+--- a/tests/gtest/include/common_data.h
++++ b/tests/gtest/include/common_data.h
+@@ -15,6 +15,20 @@ using addr_t = std::string;
+ 
+ namespace Model {
+ 
++/**
++ * @brief BGP route type.
++ *
++ * This enum class corresponds directly to FRR's BGP route type which is used
++ * alongside advertised prefixes.
++ */
++enum class BgpRoute {
++  LOCAL = 1,
++  ATTACHED,
++  EXTERNAL_BGP,
++  INTERNAL_BGP,
++  REDISTRIBUTED
++};
++
+ /**
+  * @brief Link-state node according to the BGP-LS protocol.
+  *
+@@ -42,6 +56,20 @@ struct BgpLsLink {
+ };
+ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(BgpLsLink, interface, neighbor, remote_asn)
+ 
++/**
++ * @brief Link-state prefix according to the BGP-LS protocol.
++ *
++ * This data structure is a trimmed version of FRR's prefix descriptor.
++ * Multi-Topology ID and OSPF route type are ignored due to lying out of the
++ * scope of this test suite. The original prefix descriptor data structure fully
++ * complies with RFC 9552.
++ */
++struct BgpLsPrefix {
++  BgpRoute bgp_route_type;
++  prefix_t prefix;
++};
++NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(BgpLsPrefix, bgp_route_type, prefix)
++
+ /**
+  * @brief Link-state link Network Layer Reachability Information (NLRI).
+  *
+@@ -72,6 +100,36 @@ struct BgpLsLinkNlri {
+ };
+ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(BgpLsLinkNlri, source, destination, link)
+ 
++/**
++ * @brief Link-state prefix Network Layer Reachability Information (NLRI).
++ *
++ * This data structure is a trimmed version of FRR's prefix NLRI. Because this
++ * test suite is limited to IS-IS in scope, specifying `protocol_id` would be
++ * redundant to this implementation. The original prefix NLRI data structure
++ * fully complies with RFC 9552.
++ *
++ */
++struct BgpLsPrefixNlri {
++  BgpLsNode local_node;
++  BgpLsPrefix prefix;
++
++  /**
++   * @brief Converts `BgpLsPrefixNlri` to `LinkState::PrefixNlri`.
++   *
++   * Mainly needed for checking BGP-LS's RIB table for corresponding NLRI
++   * entries. Note that `LinkState::PrefixNlri` is not the data type accepted by
++   * FRR's `bgpd` library; the required type is `struct bgp_ls_prefix_nlri`.
++   * However, the internal structure is completely replicated inside
++   * `linkstate_data.h`.
++   *
++   * In order to use the C API for determining if NLRI exists,
++   * `reinterpret_cast` is used to circumvent include errors when attempting to
++   * use the C API in C++ code.
++   */
++  explicit operator LinkState::PrefixNlri() const;
++};
++NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(BgpLsPrefixNlri, local_node, prefix)
++
+ /**
+  * @brief Unique identifier for a node in a network.
+  *
+@@ -125,15 +183,39 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(LinkStateEdge, asn, source_node,
+  * IGP-agnostic link-state representation of the network.
+  */
+ struct LinkStateAttributes {
+-  bool valid;
+   LinkStateNodeId adv;
+-  std::string name;
+-  uint32_t metric;
+   addr_t local;
+   addr_t remote;
+ };
+-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(LinkStateAttributes, valid, adv, name,
+-                                   metric, local, remote)
++NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(LinkStateAttributes, adv, local, remote)
++
++/**
++ * @brief Subnet represented by a single advertised prefix in a network.
++ *
++ * This data structure is a trimmed version of FRR's subnet. Most notably, FRR
++ * uses a red-black tree internally to speed up subnet lookups within the TED.
++ * The original subnet data structure is specific to FRR's implementation of
++ * an IGP-agnostic link-state representation of the network.
++ */
++struct LinkStateSubnet {
++  prefix_t prefix;
++};
++NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(LinkStateSubnet, prefix)
++
++/**
++ * @brief Advertised prefix within a network.
++ *
++ * This data structure is a trimmed version of FRR's prefix. FRR keeps track of
++ * 20+ fields; this test suite only uses a small subset of those fields for
++ * validations, which includes the local node and advertised prefix address. The
++ * original prefix data structure is specific to FRR's implementation of an
++ * IGP-agnostic link-state representation of the network.
++ */
++struct LinkStatePrefix {
++  LinkStateNodeId local_node;
++  prefix_t prefix;
++};
++NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(LinkStatePrefix, local_node, prefix)
+ 
+ /**
+  * @brief Link-state message event.
+diff --git a/tests/gtest/include/linkstate_data.h b/tests/gtest/include/linkstate_data.h
+index bac00fb7a8..6f66a7cc1e 100644
+--- a/tests/gtest/include/linkstate_data.h
++++ b/tests/gtest/include/linkstate_data.h
+@@ -91,7 +91,7 @@ enum class BgpRouteType : int {
+   REDISTRIBUTED
+ };
+ 
+-enum NodeDescTLV : uint16_t {
++enum class NodeDescTLV : uint16_t {
+   AS_BIT = (1ULL << 0),
+   BGP_LS_ID_BIT = (1ULL << 1),
+   OSPF_AREA_BIT = (1ULL << 2),
+@@ -126,7 +126,7 @@ struct NodeDesc {
+   in_addr bgpRouterId;
+ };
+ 
+-enum LinkDescTLV : uint32_t {
++enum class LinkDescTLV : uint32_t {
+   LINK_ID_BIT = (1ULL << 0),
+   IPV4_INTF_BIT = (1ULL << 1),
+   IPV4_NEIGH_BIT = (1ULL << 2),
+@@ -151,6 +151,13 @@ struct LinkDesc {
+   uint16_t mtId;
+ };
+ 
++enum class PrefixDescTLV : uint16_t {
++  MT_ID_BIT = (1ULL << 0),
++  OSPF_ROUTE_BIT = (1ULL << 1),
++  IP_REACH_BIT = (1ULL << 2),
++  BGP_ROUTE_TYPE_BIT = (1ULL << 3),
++};
++
+ /**
+  * @brief Replicates `bgp_ls_prefix_descriptor` in FRR.
+  */
+diff --git a/tests/gtest/src/common_data.cpp b/tests/gtest/src/common_data.cpp
+index 9b7806dd04..719169e319 100644
+--- a/tests/gtest/src/common_data.cpp
++++ b/tests/gtest/src/common_data.cpp
+@@ -1,5 +1,9 @@
+ #include "common_data.h"
+ 
++#include <charconv>
++#include <utility>
++
++#include "lib/prefix.h"
+ #include "lib/zebra.h"
+ #include "linkstate_data.h"
+ #include "utils.hpp"
+@@ -23,10 +27,45 @@ BgpLsLinkNlri::operator LinkState::LinkNlri() const {
+   inet_pton(AF_INET6, this->link.neighbor.c_str(), &nlri.link.ipv6Intf);
+ 
+   // must set valid flags
+-  SET_FLAG(nlri.local.tlvs, LinkState::NodeDescTLV::IGP_ROUTER_BIT);
+-  SET_FLAG(nlri.remote.tlvs, LinkState::NodeDescTLV::IGP_ROUTER_BIT);
+-  SET_FLAG(nlri.link.tlvs, LinkState::LinkDescTLV::IPV6_INTF_BIT);
+-  SET_FLAG(nlri.link.tlvs, LinkState::LinkDescTLV::IPV6_NEIGH_BIT);
++  SET_FLAG(nlri.local.tlvs,
++           std::to_underlying(LinkState::NodeDescTLV::IGP_ROUTER_BIT));
++  SET_FLAG(nlri.remote.tlvs,
++           std::to_underlying(LinkState::NodeDescTLV::IGP_ROUTER_BIT));
++  SET_FLAG(nlri.link.tlvs,
++           std::to_underlying(LinkState::LinkDescTLV::IPV6_INTF_BIT));
++  SET_FLAG(nlri.link.tlvs,
++           std::to_underlying(LinkState::LinkDescTLV::IPV6_NEIGH_BIT));
++
++  return nlri;
++}
++
++BgpLsPrefixNlri::operator LinkState::PrefixNlri() const {
++  LinkState::PrefixNlri nlri{.proto = LinkState::Protocol::ISIS_L1};
++
++  nlri.local.igpRouterIdLen = SysIdToBuffer(
++      nlri.local.igpRouterId.sysid, this->local_node.igp_router_id.c_str());
++
++  auto& pref = this->prefix.prefix;
++
++  std::size_t pos = pref.find("/");
++  std::string addr = pref.substr(0, pos);
++
++  nlri.prefix.prefix = {.family = AF_INET6};
++  std::from_chars(pref.c_str() + pos + 1, pref.c_str() + pref.size(),
++                  nlri.prefix.prefix.prefixlen);
++
++  inet_pton(AF_INET6, addr.c_str(), &nlri.prefix.prefix.u.prefix6);
++
++  // TODO verify this is what FRR generates
++  nlri.prefix.bgpRT = LinkState::BgpRouteType::LOCAL;
++
++  // must set valid flags
++  SET_FLAG(nlri.local.tlvs,
++           std::to_underlying(LinkState::NodeDescTLV::IGP_ROUTER_BIT));
++  SET_FLAG(nlri.prefix.tlvs,
++           std::to_underlying(LinkState::PrefixDescTLV::IP_REACH_BIT));
++  SET_FLAG(nlri.prefix.tlvs,
++           std::to_underlying(LinkState::PrefixDescTLV::BGP_ROUTE_TYPE_BIT));
+ 
+   return nlri;
+ }
+@@ -35,7 +74,6 @@ LinkStateEdge::operator BApiLinkStateUpdate() const {
+   BApiLinkStateUpdate message{.event = BEvent::UPDATE,
+                               .remote = this->destination_node,
+                               .data = {.adv = this->source_node,
+-                                       .metric = 0,
+                                        .local = this->source,
+                                        .remote = this->destination}};
+   return message;
+diff --git a/tests/gtest/src/test_bgp_ls_edge_update.cpp b/tests/gtest/src/test_bgp_ls_edge_update.cpp
+index 404daaa337..f3caad5a58 100644
+--- a/tests/gtest/src/test_bgp_ls_edge_update.cpp
++++ b/tests/gtest/src/test_bgp_ls_edge_update.cpp
+@@ -46,14 +46,6 @@ void EdgeTest::AttributesToFrr(const LinkStateAttributes& attr,
+   ASSERT_EQ(1, ret) << "[ipv6]: address is not a valid IPv6 address.";
+   frrAttr = ls_attributes_new(adv, in_addr{}, local, 0);
+ 
+-  if (!attr.name.empty()) {
+-    strncpy(frrAttr->name, attr.name.c_str(), MAX_NAME_LENGTH);
+-    SET_FLAG(frrAttr->flags, LS_ATTR_NAME);
+-  }
+-
+-  frrAttr->metric = attr.metric;
+-  SET_FLAG(frrAttr->flags, LS_ATTR_METRIC);
+-
+   in6_addr remote{};
+   ret = inet_pton(AF_INET6, attr.remote.c_str(), (void*)&remote);
+   ASSERT_EQ(1, ret) << "[ipv6]: remote address is not a valid IPv6 address.";
+@@ -104,8 +96,6 @@ void EdgeTest::SendAttributesMessage(const ls_attributes& attr,
+     stream_putc(s, '\0');
+   }
+ 
+-  stream_putl(s, attr.metric);
+-
+   if (reverse) {
+     stream_put(s, (void*)&attr.standard.remote6, IPV6_MAX_BYTELEN);
+     stream_put(s, (void*)&attr.standard.local6, IPV6_MAX_BYTELEN);
+-- 
+2.34.1
+

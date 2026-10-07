@@ -1,0 +1,197 @@
+From f44889d3b7c53928f412d822ec613cc398e759e7 Mon Sep 17 00:00:00 2001
+From: Gabe Lapingcao <mgultra2018@gmail.com>
+Date: Thu, 16 Jul 2026 12:28:16 -0700
+Subject: [PATCH 04/14] [tests/gtest]: duplicate FRR's string buffer data
+ structure
+
+Attempting to compile against FRR's `lib/sbuf.h` header results in an
+"unknown type" error by the C compiler. This is because FRR uses the C11
+standard which does not include the `bool` type. The duplicate `sbuf.h`
+file corrects this by including `<stdbool.h>`.
+
+Signed-off-by: Gabe Lapingcao <mgultra2018@gmail.com>
+---
+ tests/gtest/include/sbuf.h | 82 ++++++++++++++++++++++++++++++++++++++
+ tests/gtest/src/sbuf.c     | 79 ++++++++++++++++++++++++++++++++++++
+ 2 files changed, 161 insertions(+)
+ create mode 100644 tests/gtest/include/sbuf.h
+ create mode 100644 tests/gtest/src/sbuf.c
+
+diff --git a/tests/gtest/include/sbuf.h b/tests/gtest/include/sbuf.h
+new file mode 100644
+index 0000000000..fee72e447f
+--- /dev/null
++++ b/tests/gtest/include/sbuf.h
+@@ -0,0 +1,82 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * Simple string buffer
++ *
++ * Copyright (C) 2017 Christian Franke
++ *
++ * Modified 2026 Gabe Lapingcao
++ *
++ * The only modification done is adding the <stdbool.h> header file. CMake
++ * complains about an undefined type without it.
++ */
++#ifndef SBUF_H
++#define SBUF_H
++
++// requires stdbool.h to compile correctly
++#include <stdbool.h>
++#include <stddef.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/*
++ * sbuf provides a simple string buffer. One application where this comes
++ * in handy is the parsing of binary data: If there is an error in the parsing
++ * process due to invalid input data, printing an error message explaining what
++ * went wrong is definitely useful. However, just printing the actual error,
++ * without any information about the previous parsing steps, is usually not very
++ * helpful.
++ * Using sbuf, the parser can log the whole parsing process into a buffer using
++ * a printf like API. When an error occurs, all the information about previous
++ * parsing steps is there in the log, without any need for backtracking, and can
++ * be used to give a detailed and useful error description.
++ * When parsing completes successfully without any error, the log can just be
++ * discarded unless debugging is turned on, to not spam the log.
++ *
++ * For the described usecase, the code would look something like this:
++ *
++ * int sbuf_example(..., char **parser_log)
++ * {
++ *         struct sbuf logbuf;
++ *
++ *         sbuf_init(&logbuf, NULL, 0);
++ *         sbuf_push(&logbuf, 0, "Starting parser\n");
++ *
++ *         int rv = do_parse(&logbuf, ...);
++ *
++ *         *parser_log = sbuf_buf(&logbuf);
++ *
++ *         return 1;
++ * }
++ *
++ * In this case, sbuf_example uses a string buffer with undefined size, which
++ * will
++ * be allocated on the heap by sbuf. The caller of sbuf_example is expected to
++ * free
++ * the string returned in parser_log.
++ */
++
++#define SBUF_DEFAULT_SIZE 8192
++
++struct sbuf {
++  bool fixed;
++  char *buf;
++  size_t size;
++  size_t pos;
++  int indent;
++};
++
++void sbuf_init(struct sbuf *dest, char *buf, size_t size);
++void sbuf_reset(struct sbuf *buf);
++const char *sbuf_buf(struct sbuf *buf);
++void sbuf_free(struct sbuf *buf);
++#include "lib/log.h"
++void sbuf_push(struct sbuf *buf, int indent, const char *format, ...)
++    PRINTFRR(3, 4);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+\ No newline at end of file
+diff --git a/tests/gtest/src/sbuf.c b/tests/gtest/src/sbuf.c
+new file mode 100644
+index 0000000000..db859690f0
+--- /dev/null
++++ b/tests/gtest/src/sbuf.c
+@@ -0,0 +1,79 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * Simple string buffer
++ *
++ * Copyright (C) 2017 Christian Franke
++ *
++ * Modified 2026 Gabe Lapingcao
++ */
++#include "sbuf.h"
++
++#include <zebra.h>
++
++#include "memory.h"
++#include "printfrr.h"
++
++void sbuf_init(struct sbuf *dest, char *buf, size_t size) {
++  dest->fixed = (size > 0);
++  if (dest->fixed) {
++    dest->buf = buf;
++    dest->size = size;
++  } else {
++    dest->buf = XMALLOC(MTYPE_TMP, SBUF_DEFAULT_SIZE);
++    dest->size = SBUF_DEFAULT_SIZE;
++  }
++
++  dest->pos = 0;
++  dest->buf[0] = '\0';
++}
++
++void sbuf_reset(struct sbuf *dest) {
++  dest->pos = 0;
++  dest->buf[0] = '\0';
++}
++
++const char *sbuf_buf(struct sbuf *buf) { return buf->buf; }
++
++void sbuf_free(struct sbuf *buf) {
++  if (!buf->fixed) XFREE(MTYPE_TMP, buf->buf);
++}
++
++void sbuf_push(struct sbuf *buf, int indent, const char *format, ...) {
++  va_list args;
++  int written;
++
++  if (!buf->fixed) {
++    int written1, written2;
++    size_t new_size;
++
++    written1 = indent;
++    va_start(args, format);
++    written2 = vsnprintfrr(NULL, 0, format, args);
++    va_end(args);
++
++    new_size = buf->size;
++    if (written1 >= 0 && written2 >= 0) {
++      while (buf->pos + written1 + written2 >= new_size) new_size *= 2;
++      if (new_size > buf->size) {
++        buf->buf = XREALLOC(MTYPE_TMP, buf->buf, new_size);
++        buf->size = new_size;
++      }
++    }
++  }
++
++  written =
++      snprintf(buf->buf + buf->pos, buf->size - buf->pos, "%*s", indent, "");
++
++  if (written >= 0) buf->pos += written;
++  if (buf->pos > buf->size) buf->pos = buf->size;
++
++  va_start(args, format);
++  written =
++      vsnprintfrr(buf->buf + buf->pos, buf->size - buf->pos, format, args);
++  va_end(args);
++
++  if (written >= 0) buf->pos += written;
++  if (buf->pos > buf->size) buf->pos = buf->size;
++
++  if (buf->pos == buf->size) assert(!"Buffer filled up!");
++}
+\ No newline at end of file
+-- 
+2.34.1
+

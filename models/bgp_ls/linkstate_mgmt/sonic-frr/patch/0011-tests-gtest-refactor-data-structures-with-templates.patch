@@ -1,0 +1,914 @@
+From 90f8d0bc5edb19175dfd397512d737c6785e3970 Mon Sep 17 00:00:00 2001
+From: Gabe Lapingcao <mgultra2018@gmail.com>
+Date: Tue, 18 Aug 2026 13:56:08 -0700
+Subject: [PATCH 11/14] [tests/gtest]: refactor data structures with templates
+
+Changes common data structures, such as `BApiLinkStateUpdate`, to use
+templates to separate link updates versus prefix updates.
+
+Signed-off-by: Gabe Lapingcao <mgultra2018@gmail.com>
+---
+ tests/gtest/CMakeLists.txt                    |   2 +-
+ tests/gtest/include/common_data.h             | 140 ++++++----
+ tests/gtest/include/test_bgp_ls_edge_update.h |  28 ++
+ .../include/test_bgp_ls_linkstate_update.h    | 142 ++++++++--
+ tests/gtest/src/common_data.cpp               |  10 -
+ tests/gtest/src/main.cpp                      |   7 +-
+ tests/gtest/src/test_bgp_ls_edge_update.cpp   |  98 +++++++
+ .../src/test_bgp_ls_linkstate_update.cpp      | 242 ------------------
+ 8 files changed, 349 insertions(+), 320 deletions(-)
+ create mode 100644 tests/gtest/include/test_bgp_ls_edge_update.h
+ create mode 100644 tests/gtest/src/test_bgp_ls_edge_update.cpp
+ delete mode 100644 tests/gtest/src/test_bgp_ls_linkstate_update.cpp
+
+diff --git a/tests/gtest/CMakeLists.txt b/tests/gtest/CMakeLists.txt
+index 3ddf24989e..7194346b19 100644
+--- a/tests/gtest/CMakeLists.txt
++++ b/tests/gtest/CMakeLists.txt
+@@ -54,7 +54,7 @@ add_executable(model_tests
+     "src/bgpd_env.cpp"
+     "src/common_data.cpp"
+     "src/main.cpp" 
+-    "src/test_bgp_ls_linkstate_update.cpp" 
++    "src/test_bgp_ls_edge_update.cpp" 
+ 
+     "src/frr_bridge.c"
+     "src/sbuf.c"                        # used to print logs opposed to lib/sbuf.h
+diff --git a/tests/gtest/include/common_data.h b/tests/gtest/include/common_data.h
+index 367b0a1519..ac7b9abdc1 100644
+--- a/tests/gtest/include/common_data.h
++++ b/tests/gtest/include/common_data.h
+@@ -1,6 +1,8 @@
+ #ifndef COMMON_DATA_H
+ #define COMMON_DATA_H
+ 
++#include <algorithm>
++#include <concepts>
+ #include <cstdint>
+ #include <nlohmann/json.hpp>
+ #include <string>
+@@ -20,6 +22,8 @@ const char* const JSON_TYPE_EDGE = "edge";
+ const char* const JSON_TYPE_SUBNET = "subnet";
+ const char* const JSON_TYPE_LINK_NLRI = "link_nlri";
+ const char* const JSON_TYPE_PREFIX_NLRI = "prefix_nlri";
++const char* const JSON_TYPE_ATTRIBUTES = "attributes";
++const char* const JSON_TYPE_PREFIX = "prefix";
+ 
+ /**
+  * @brief BGP route type.
+@@ -152,6 +156,17 @@ struct LinkStateNodeId {
+ };
+ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(LinkStateNodeId, iso_sys_id, level)
+ 
++struct LinkStateAttributes;
++struct LinkStatePrefix;
++
++/**
++ * @brief Template constraint for `LinkStateAttributes` and `LinkStatePrefix`.
++ */
++template <typename T>
++concept AttrPref =
++    std::same_as<T, LinkStateAttributes> || std::same_as<T, LinkStatePrefix>;
++
++template <AttrPref T>
+ struct BApiLinkStateUpdate;
+ 
+ /**
+@@ -175,7 +190,7 @@ struct LinkStateEdge {
+    * Mainly needed for populating BGP-LS's TED before the main test run within
+    * the test suite.
+    */
+-  explicit operator BApiLinkStateUpdate() const;
++  explicit operator BApiLinkStateUpdate<LinkStateAttributes>() const;
+ };
+ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(LinkStateEdge, asn, source_node,
+                                    destination_node, source, destination)
+@@ -325,25 +340,40 @@ namespace Model {
+  * this implementation. The original message data structure is specific the
+  * Zebra API's Opaque message system.
+  */
++template <AttrPref T>
+ struct BApiLinkStateUpdate {
+   BEvent event;
+   LinkStateNodeId remote;
+-  DataVar data;
+-};
+-inline void to_json(nlohmann::json& j, const BApiLinkStateUpdate& msg) {
+-  j = nlohmann::json{{"event", msg.event}, {"data", msg.data}};
++  T data;
+ 
+-  if (msg.remote != LinkStateNodeId{}) {
+-    j["remote"] = msg.remote;
+-  }
+-}
+-inline void from_json(const nlohmann::json& j, BApiLinkStateUpdate& msg) {
+-  j.at("event").get_to(msg.event);
+-  j.at("data").get_to(msg.data);
++  friend inline void to_json(nlohmann::json& j,
++                             const BApiLinkStateUpdate& msg) {
++    j = nlohmann::json{{"event", msg.event}, {"data", msg.data}};
+ 
+-  if (j.contains("remote")) {
+-    j.at("remote").get_to(msg.remote);
++    if (msg.remote != LinkStateNodeId{}) {
++      j["remote"] = msg.remote;
++    }
++  }
++  friend inline void from_json(const nlohmann::json& j,
++                               BApiLinkStateUpdate& msg) {
++    j.at("event").get_to(msg.event);
++    j.at("data").get_to(msg.data);
++
++    if (j.contains("remote")) {
++      j.at("remote").get_to(msg.remote);
++    }
+   }
++};
++
++inline LinkStateEdge::operator BApiLinkStateUpdate<LinkStateAttributes>()
++    const {
++  BApiLinkStateUpdate<LinkStateAttributes> message{
++      .event = BEvent::UPDATE,
++      .remote = this->destination_node,
++      .data = {.adv = this->source_node,
++               .local = this->source,
++               .remote = this->destination}};
++  return message;
+ }
+ 
+ /**
+@@ -372,33 +402,39 @@ inline void from_json(const nlohmann::json& j, BgpLsLinkState& ls) {
+ /**
+  * @brief Model test case containing initial state, transition, and final state.
+  */
++template <AttrPref T>
+ struct TestCase {
+   int test_id;
+-  std::string op;  // currently always "api_bgp_ls_edge_update"
++  std::string op;
+   BgpLsLinkState initial_state;
+-  BApiLinkStateUpdate api_param;
++  BApiLinkStateUpdate<T> api_param;
+   BgpLsLinkState final_state;
+   // TODO "UpdateMessage" key
++
++  friend inline void to_json(nlohmann::json& j, const TestCase<T>& tc) {
++    j = nlohmann::json{{"TestId", tc.test_id},
++                       {"Op", tc.op},
++                       {"InitialState", tc.initial_state},
++                       {"ApiParam", tc.api_param},
++                       {"FinalState", tc.final_state}};
++  }
++  friend inline void from_json(const nlohmann::json& j, TestCase<T>& tc) {
++    j.at("TestId").get_to(tc.test_id);
++    j.at("Op").get_to(tc.op);
++    j.at("InitialState").get_to(tc.initial_state);
++    j.at("ApiParam").get_to(tc.api_param);
++    j.at("FinalState").get_to(tc.final_state);
++  }
+ };
+-inline void to_json(nlohmann::json& j, const TestCase& tc) {
+-  j = nlohmann::json{{"TestId", tc.test_id},
+-                     {"Op", tc.op},
+-                     {"InitialState", tc.initial_state},
+-                     {"ApiParam", tc.api_param},
+-                     {"FinalState", tc.final_state}};
+-}
+-inline void from_json(const nlohmann::json& j, TestCase& tc) {
+-  j.at("TestId").get_to(tc.test_id);
+-  j.at("Op").get_to(tc.op);
+-  j.at("InitialState").get_to(tc.initial_state);
+-  j.at("ApiParam").get_to(tc.api_param);
+-  j.at("FinalState").get_to(tc.final_state);
+-}
++
++using AttrVec = std::vector<TestCase<LinkStateAttributes>>;
++using PrefVec = std::vector<TestCase<LinkStatePrefix>>;
+ 
+ /**
+  * @brief `TestCase` objects used in the Google Test value-parameterized tests.
+  */
+-inline std::vector<TestCase> testCases;
++inline AttrVec linkTestCases;
++inline PrefVec prefixTestCases;
+ 
+ /**
+  * @brief Prints information about `TestCase` instances.
+@@ -409,20 +445,38 @@ inline std::vector<TestCase> testCases;
+  * `AbslStringify` is an alternative function that Google Test uses in the same
+  * manner.
+  */
+-inline void PrintTo(const TestCase& tc, std::ostream* os) {
+-  std::string type;
+-  if (std::holds_alternative<LinkStateAttributes>(tc.api_param.data)) {
+-    type = "attributes";
+-  } else if (std::holds_alternative<LinkStatePrefix>(tc.api_param.data)) {
+-    type = "prefix";
+-  } else {
+-    type = "undefined";
+-  }
+-
+-  *os << "{ ID: " << tc.test_id << ", Op: " << tc.op << ", Type: " << type
+-      << " }";
++template <AttrPref T>
++inline void PrintTo(const TestCase<T>& tc, std::ostream* os) {
++  *os << "{ ID: " << tc.test_id << ", Op: " << tc.op << " }";
+ }
+ 
+ }  // namespace Model
+ 
++namespace nlohmann {
++
++#define COND_API_TYPE_OF(T)                                          \
++  val.contains("ApiParam") && val.at("ApiParam").contains("data") && \
++      val.at("ApiParam").at("data").value("type", "") == T
++
++template <>
++struct adl_serializer<Model::AttrVec> {
++  static void to_json(json& j, const Model::AttrVec& vec) {
++    j = json::array();
++    for (const Model::TestCase<Model::LinkStateAttributes>& tc : vec) {
++      json obj = tc;
++      j.push_back(obj);
++    }
++  }
++
++  static void from_json(const json& j, Model::AttrVec& vec) {
++    for (const json& val : j) {
++      if (COND_API_TYPE_OF(Model::JSON_TYPE_ATTRIBUTES)) {
++        vec.push_back(val.get<Model::TestCase<Model::LinkStateAttributes>>());
++      }
++    }
++  }
++};
++
++}  // namespace nlohmann
++
+ #endif  // COMMON_DATA_H
+diff --git a/tests/gtest/include/test_bgp_ls_edge_update.h b/tests/gtest/include/test_bgp_ls_edge_update.h
+new file mode 100644
+index 0000000000..a700590907
+--- /dev/null
++++ b/tests/gtest/include/test_bgp_ls_edge_update.h
+@@ -0,0 +1,28 @@
++#ifndef TEST_BGP_LS_EDGE_UPDATE_H
++#define TEST_BGP_LS_EDGE_UPDATE_H
++
++#include <gtest/gtest.h>
++
++#include "common_data.h"
++#include "test_bgp_ls_linkstate_update.h"
++
++/**
++ * Hacky solution to compiling with C++ (keyword delete cannot be used as a
++ * variable name); see https://stackoverflow.com/a/25647229
++ */
++#define delete to_delete
++#include "lib/link_state.h"
++#undef delete
++
++namespace Model {
++
++class EdgeTest : public LinkStateTest<LinkStateAttributes, ls_attributes> {
++ protected:
++  virtual ls_attributes* SendUpdateMessage(
++      const BApiLinkStateUpdate<LinkStateAttributes>& apiMessage)
++      const override;
++};
++
++}  // namespace Model
++
++#endif  // TEST_BGP_LS_EDGE_UPDATE_H
+diff --git a/tests/gtest/include/test_bgp_ls_linkstate_update.h b/tests/gtest/include/test_bgp_ls_linkstate_update.h
+index 98d00a9c2d..64e23db23a 100644
+--- a/tests/gtest/include/test_bgp_ls_linkstate_update.h
++++ b/tests/gtest/include/test_bgp_ls_linkstate_update.h
+@@ -2,9 +2,22 @@
+ #define TEST_BGP_LS_LINKSTATE_UPDATE_H
+ 
+ #include <gtest/gtest.h>
+-#include <netinet/in.h>
++
++#include <algorithm>
++#include <cctype>
++#include <concepts>
++#include <cstdint>
++#include <fstream>
++#include <nlohmann/json.hpp>
++#include <variant>
+ 
+ #include "common_data.h"
++#include "frr_bridge.h"
++#include "lib/stream.h"
++#include "lib/zclient.h"
++#include "linkstate_data.h"
++#include "sbuf.h"
++#include "utils.hpp"
+ 
+ /**
+  * Hacky solution to compiling with C++ (keyword delete cannot be used as a
+@@ -16,7 +29,9 @@
+ 
+ namespace Model {
+ 
+-class LinkStateTest : public testing::TestWithParam<TestCase> {
++template <AttrPref T, typename U>
++requires std::same_as<U, ls_attributes> || std::same_as<U, ls_prefix>
++class LinkStateTest : public testing::TestWithParam<TestCase<T>> {
+  public:
+   /**
+    * @brief Sets debugging on (true) or off (false).
+@@ -24,7 +39,7 @@ class LinkStateTest : public testing::TestWithParam<TestCase> {
+    * Debugging on prints BGP-LS's TED and RIB table to the console during Google
+    * Test runs. Debugging off skips these lines.
+    */
+-  static void SetDebugMode(bool debug);
++  static inline void SetDebugMode(bool debug) { DebugMode = debug; }
+ 
+  protected:
+   /**
+@@ -33,9 +48,14 @@ class LinkStateTest : public testing::TestWithParam<TestCase> {
+    *
+    * Most of the work is done inside `bridge_check_bgpd_running` and
+    * `bridge_clear_bgp_ls_ted` within frr_bridge.h. Fails the current test run
+-   * if either condition is note met.
++   * if either condition is not met.
+    */
+-  virtual void SetUp() override;
++  virtual inline void SetUp() override final {
++    ASSERT_TRUE(bridge_check_bgpd_running())
++        << "[Fixture SetUp]: bgpd is not running.";
++    ASSERT_TRUE(bridge_check_ls_clear())
++        << "[Fixture SetUp]: BGP-LS TED is not empty.";
++  }
+ 
+   /**
+    * @brief Clears the BGP instance's link-state TED.
+@@ -44,12 +64,7 @@ class LinkStateTest : public testing::TestWithParam<TestCase> {
+    * frr_bridge.h. This function simply acts as a C++ wrapper around the
+    * bridge's C implementation.
+    */
+-  virtual void TearDown() override;
+-
+-  /**
+-   * @brief Checks
+-   */
+-  void ArrangeLinkTest(const TestCase& tc) const;
++  virtual inline void TearDown() override final { bridge_clear_bgp_ls_ted(); }
+ 
+   /**
+    * @brief Converts a `LinkStateNodeId` to FRR's `ls_node_id`.
+@@ -63,7 +78,14 @@ class LinkStateTest : public testing::TestWithParam<TestCase> {
+    * @param frrNodeId       FRR link-state node ID to be populated with the ISO
+    *                            sys ID from `nodeId`.
+    */
+-  void NodeIdToFrr(const LinkStateNodeId& nodeId, ls_node_id& frrNodeId) const;
++  inline void NodeIdToFrr(const LinkStateNodeId& nodeId,
++                          ls_node_id& frrNodeId) const {
++    // for now, we default to IS-IS level 1
++    frrNodeId = {.origin = ls_origin::ISIS_L1, .id = {.iso = {.level = 1}}};
++    int ret = SysIdToBuffer(frrNodeId.id.iso.sys_id, nodeId.iso_sys_id.c_str());
++    ASSERT_EQ(ISIS_SYS_ID_LEN, ret)
++        << "[sys_id]: node ID is not a valid ISO system identifier.";
++  }
+ 
+   /**
+    * @brief Converts `LinkStateAttributes` to FRR's `ls_attributes`.
+@@ -84,8 +106,22 @@ class LinkStateTest : public testing::TestWithParam<TestCase> {
+    * @param frrAttr     FRR link-state attributes to be populated with
+    *                        corresponding fields in `attr`.
+    */
+-  void AttributesToFrr(const LinkStateAttributes& attr, const ls_node_id& adv,
+-                       ls_attributes*& frrAttr) const;
++  inline void AttributesToFrr(const LinkStateAttributes& attr,
++                              const ls_node_id& adv,
++                              ls_attributes*& frrAttr) const {
++    in6_addr local{};
++    int ret = inet_pton(AF_INET6, attr.local.c_str(), (void*)&local);
++
++    ASSERT_EQ(1, ret) << "[ipv6]: address is not a valid IPv6 address.";
++    frrAttr = ls_attributes_new(adv, in_addr{}, local, 0);
++
++    in6_addr remote{};
++    ret = inet_pton(AF_INET6, attr.remote.c_str(), (void*)&remote);
++    ASSERT_EQ(1, ret) << "[ipv6]: remote address is not a valid IPv6 address.";
++
++    frrAttr->standard.remote6 = remote;
++    SET_FLAG(frrAttr->flags, LS_ATTR_NEIGH_ADDR6);
++  }
+ 
+   /**
+    * @brief Sends a `ls_node` with type `event` to the BGP daemon.
+@@ -95,7 +131,22 @@ class LinkStateTest : public testing::TestWithParam<TestCase> {
+    * @param node      FRR link-state node to send to the BGP daemon.
+    * @param event     Link-state message event type.
+    */
+-  void SendNodeMessage(const ls_node& node, BEvent event) const;
++  inline void SendNodeMessage(const ls_node& node, BEvent event) const {
++    stream* s = stream_new(ZEBRA_MAX_PACKET_SIZ);
++
++    // from ls_format_msg (lib/link_state.c, lines 1771, 1794)
++    stream_putc(s, static_cast<uint8_t>(event));
++    stream_putc(s, LS_MSG_TYPE_NODE);
++
++    // from ls_format_node (lib/link_state.c, lines 1532-1580)
++    stream_put(s, &node.adv, sizeof(struct ls_node_id));
++    stream_putw(s, node.flags);
++
++    stream_put(s, &node.router_id6, IPV6_MAX_BYTELEN);
++
++    bridge_send_message(s, zapi_opaque_registry::LINK_STATE_UPDATE);
++    stream_free(s);
++  }
+ 
+   /**
+    * @brief Sends `ls_attributes` with type `event` to the BGP daemon.
+@@ -114,7 +165,40 @@ class LinkStateTest : public testing::TestWithParam<TestCase> {
+    */
+   void SendAttributesMessage(const ls_attributes& attr,
+                              const ls_node_id& remoteNodeId, BEvent event,
+-                             bool reverse = false) const;
++                             bool reverse = false) const {
++    stream* s = stream_new(ZEBRA_MAX_PACKET_SIZ);
++
++    stream_putc(s, static_cast<uint8_t>(event));
++    stream_putc(s, LS_MSG_TYPE_ATTRIBUTES);
++
++    if (reverse) {
++      stream_put(s, (void*)&attr.adv, sizeof(ls_node_id));
++      stream_put(s, (void*)&remoteNodeId, sizeof(ls_node_id));
++    } else {
++      stream_put(s, (void*)&remoteNodeId, sizeof(ls_node_id));
++      stream_put(s, (void*)&attr.adv, sizeof(ls_node_id));
++    }
++
++    stream_putl(s, attr.flags);
++
++    if (CHECK_FLAG(attr.flags, LS_ATTR_NAME)) {
++      size_t len = strlen(attr.name);
++      stream_putc(s, len + 1);
++      stream_put(s, (void*)attr.name, len);
++      stream_putc(s, '\0');
++    }
++
++    if (reverse) {
++      stream_put(s, (void*)&attr.standard.remote6, IPV6_MAX_BYTELEN);
++      stream_put(s, (void*)&attr.standard.local6, IPV6_MAX_BYTELEN);
++    } else {
++      stream_put(s, (void*)&attr.standard.local6, IPV6_MAX_BYTELEN);
++      stream_put(s, (void*)&attr.standard.remote6, IPV6_MAX_BYTELEN);
++    }
++
++    bridge_send_message(s, zapi_opaque_registry::LINK_STATE_UPDATE);
++    stream_free(s);
++  }
+ 
+   /**
+    * @brief Sends messages to the BGP daemon for edge updates.
+@@ -126,11 +210,10 @@ class LinkStateTest : public testing::TestWithParam<TestCase> {
+    *
+    * @param apiMessage      `UPDATE` message specified by the current
+    *                            `TestCase`.
+-   * @param frrAttr         FRR link-state attributes to allocate. Managed by
+-   *                            the caller of this function.
++   * @return                FRR... (TODO)
+    */
+-  void SendLinkUpdateMessage(const BApiLinkStateUpdate& apiMessage,
+-                             ls_attributes*& frrAttr) const;
++  virtual U* SendUpdateMessage(
++      const BApiLinkStateUpdate<T>& apiMessage) const = 0;
+ 
+   /**
+    * @brief Verifies the entirety of the model's RIB exists within the current
+@@ -144,10 +227,27 @@ class LinkStateTest : public testing::TestWithParam<TestCase> {
+    * @param rib     Collection of `BgpLsLinkNlri` containing NLRI to check the
+    *                    RIB with.
+    */
+-  void VerifyNlri(const std::vector<Model::RibVar>& rib) const;
++  inline void VerifyNlri(const std::vector<Model::RibVar>& rib) const {
++    for (const Model::RibVar& var : rib) {
++      if (const BgpLsLinkNlri* entry = std::get_if<BgpLsLinkNlri>(&var)) {
++        LinkState::LinkNlri nlri = static_cast<LinkState::LinkNlri>(*entry);
++        LinkState::ParentNlri p{.type = LinkState::NlriType::LINK,
++                                .data = {.link = nlri}};
++        // WARNING: unsafe cast; this is being used to bypass include errors
++        // with the FRR bgpd library
++        bgp_ls_nlri* nlriCast = reinterpret_cast<bgp_ls_nlri*>(&p);
++        ASSERT_TRUE(bridge_link_exists_nlri(nlriCast))
++            << "[bgp_ls_nlri]: NLRI does not exist within the RIB.";
++      } else if (const BgpLsPrefixNlri* entry =
++                     std::get_if<BgpLsPrefixNlri>(&var)) {
++        // TODO
++      }
++    }
++  }
+ 
+   static inline bool DebugMode = false;
+ };
++
+ }  // namespace Model
+ 
+ #endif  // TEST_BGP_LS_LINKSTATE_UPDATE_H
+diff --git a/tests/gtest/src/common_data.cpp b/tests/gtest/src/common_data.cpp
+index c42f4488db..e6335f260e 100644
+--- a/tests/gtest/src/common_data.cpp
++++ b/tests/gtest/src/common_data.cpp
+@@ -71,14 +71,4 @@ BgpLsPrefixNlri::operator LinkState::PrefixNlri() const {
+   return nlri;
+ }
+ 
+-LinkStateEdge::operator BApiLinkStateUpdate() const {
+-  BApiLinkStateUpdate message{.event = BEvent::UPDATE,
+-                              .remote = this->destination_node};
+-  LinkStateAttributes attr = {.adv = this->source_node,
+-                              .local = this->source,
+-                              .remote = this->destination};
+-  message.data = attr;
+-  return message;
+-}
+-
+ }  // namespace Model
+diff --git a/tests/gtest/src/main.cpp b/tests/gtest/src/main.cpp
+index b5ab709c52..1f8b8b8093 100644
+--- a/tests/gtest/src/main.cpp
++++ b/tests/gtest/src/main.cpp
+@@ -9,7 +9,7 @@
+ 
+ #include "bgpd_env.h"
+ #include "common_data.h"
+-#include "test_bgp_ls_linkstate_update.h"
++#include "test_bgp_ls_edge_update.h"
+ 
+ /**
+  * Entrypoint for Google Test execution. Before initializing the testing
+@@ -28,12 +28,13 @@ int main(int argc, char** argv) {
+   std::ifstream raw(jsonPath);
+ 
+   nlohmann::json data = nlohmann::json::parse(raw);
+-  Model::testCases = data.get<std::vector<Model::TestCase>>();
++  Model::linkTestCases =
++      data.get<std::vector<Model::TestCase<Model::LinkStateAttributes>>>();
+ 
+   std::vector<std::string_view> args(argv, argv + argc);
+   for (const auto& arg : args) {
+     if (arg == "--debug" || arg == "-d") {
+-      Model::LinkStateTest::SetDebugMode(true);
++      Model::EdgeTest::SetDebugMode(true);
+     }
+   }
+ 
+diff --git a/tests/gtest/src/test_bgp_ls_edge_update.cpp b/tests/gtest/src/test_bgp_ls_edge_update.cpp
+new file mode 100644
+index 0000000000..89323c7135
+--- /dev/null
++++ b/tests/gtest/src/test_bgp_ls_edge_update.cpp
+@@ -0,0 +1,98 @@
++#include "test_bgp_ls_edge_update.h"
++
++#include "common_data.h"
++
++namespace Model {
++
++ls_attributes* EdgeTest::SendUpdateMessage(
++    const BApiLinkStateUpdate<LinkStateAttributes>& apiMessage) const {
++  ls_attributes* attr;
++
++  // TODO model may have IS-IS level as a free variable to test for IS-IS
++  // interoperability between level 1 and level 2 nodes (specifically 1/2
++  // nodes); check this again in the future
++  ls_node_id remote_node_id{};
++  NodeIdToFrr(apiMessage.remote, remote_node_id);
++
++  // TODO same as remote node - see above
++  ls_node_id adv_node_id{};
++  NodeIdToFrr(apiMessage.data.adv, adv_node_id);
++
++  AttributesToFrr(apiMessage.data, adv_node_id, attr);
++
++  struct ls_node* remote_node =
++      ls_node_new(remote_node_id, in_addr{}, attr->standard.remote6);
++  SendNodeMessage(*remote_node, apiMessage.event);
++
++  struct ls_node* adv_node =
++      ls_node_new(adv_node_id, in_addr{}, attr->standard.local6);
++  SendNodeMessage(*adv_node, apiMessage.event);
++
++  SendAttributesMessage(*attr, remote_node_id, apiMessage.event);  // forward
++  SendAttributesMessage(*attr, remote_node_id, apiMessage.event,
++                        true);  // reverse
++
++  ls_node_del(adv_node);
++  ls_node_del(remote_node);
++
++  return attr;
++}
++
++TEST_P(EdgeTest, ValidateEdgeUpdate) {
++  // Arrange
++  TestCase tc = GetParam();
++
++  if (IsSysIdUnspecified(tc.api_param.data.adv.iso_sys_id.c_str()) ||
++      IsSysIdUnspecified(tc.api_param.remote.iso_sys_id.c_str()) ||
++      IsIpv6Unspecified(tc.api_param.data.local.c_str()) ||
++      IsIpv6Unspecified(tc.api_param.data.remote.c_str())) {
++    GTEST_SKIP() << "[ls_attr]: test " << tc.test_id
++                 << " provides no meaningful input.";
++  }
++
++  // Note that for arrange, we also want to place TED entries before the one
++  // we actually want to test
++  for (const TedVar& var : tc.initial_state.ted) {
++    if (const LinkStateEdge* edge = std::get_if<LinkStateEdge>(&var)) {
++      BApiLinkStateUpdate<LinkStateAttributes> msg =
++          static_cast<BApiLinkStateUpdate<LinkStateAttributes>>(*edge);
++      ls_attributes* tempAttr = SendUpdateMessage(msg);
++      ls_attributes_del(tempAttr);
++    } else if (const LinkStateSubnet* subnet =
++                   std::get_if<LinkStateSubnet>(&var)) {
++      // TODO
++    }
++    // ignore other alternatives
++  }
++
++  // Act
++  ls_attributes* attr = SendUpdateMessage(tc.api_param);
++
++  // Debug
++  if (EdgeTest::DebugMode) {
++    struct sbuf sbuf;
++    sbuf_init(&sbuf, NULL, 0);
++
++    bridge_show_ted(&sbuf);
++    bridge_show_table(&sbuf);
++    std::cout << sbuf_buf(&sbuf) << std::endl;
++    sbuf_free(&sbuf);
++  }
++
++  // Assert
++  ASSERT_TRUE(bridge_edge_exists_ted(attr))
++      << "[ls_attributes]: edge does not exist within TED.";
++  VerifyNlri(tc.final_state.rib);
++
++  // Clean
++  ls_attributes_del(attr);
++}
++
++// supplies a custom ID generator based on the TestId field in JSON
++INSTANTIATE_TEST_SUITE_P(
++    CrossHairCoverageTestCases, EdgeTest, ::testing::ValuesIn(linkTestCases),
++    [](const ::testing::TestParamInfo<EdgeTest::ParamType>& info) {
++      return std::to_string(info.param.test_id);
++    });
++
++}  // namespace Model
+diff --git a/tests/gtest/src/test_bgp_ls_linkstate_update.cpp b/tests/gtest/src/test_bgp_ls_linkstate_update.cpp
+deleted file mode 100644
+index bdc02be0a0..0000000000
+--- a/tests/gtest/src/test_bgp_ls_linkstate_update.cpp
++++ /dev/null
+@@ -1,242 +0,0 @@
+-#include "test_bgp_ls_linkstate_update.h"
+-
+-#include <arpa/inet.h>
+-
+-#include <algorithm>
+-#include <cctype>
+-#include <cstdint>
+-#include <fstream>
+-#include <nlohmann/json.hpp>
+-#include <variant>
+-
+-#include "frr_bridge.h"
+-#include "lib/stream.h"
+-#include "lib/zclient.h"
+-#include "linkstate_data.h"
+-#include "sbuf.h"
+-#include "utils.hpp"
+-
+-namespace Model {
+-
+-void LinkStateTest::SetUp() {
+-  ASSERT_TRUE(bridge_check_bgpd_running())
+-      << "[Fixture SetUp]: bgpd is not running.";
+-  ASSERT_TRUE(bridge_check_ls_clear())
+-      << "[Fixture SetUp]: BGP-LS TED is not empty.";
+-}
+-
+-void LinkStateTest::TearDown() { bridge_clear_bgp_ls_ted(); }
+-
+-void LinkStateTest::SetDebugMode(bool debug) {
+-  LinkStateTest::DebugMode = debug;
+-}
+-
+-void LinkStateTest::ArrangeLinkTest(const TestCase& tc) const {
+-  const LinkStateAttributes* attr =
+-      std::get_if<LinkStateAttributes>(&tc.api_param.data);
+-
+-  ASSERT_FALSE(attr == nullptr)
+-      << "[DataVar]: tc.api_param.data is not type LinkStateAttributes.";
+-
+-  if (IsSysIdUnspecified(attr->adv.iso_sys_id.c_str()) ||
+-      IsSysIdUnspecified(tc.api_param.remote.iso_sys_id.c_str()) ||
+-      IsIpv6Unspecified(attr->local.c_str()) ||
+-      IsIpv6Unspecified(attr->remote.c_str())) {
+-    GTEST_SKIP() << "[ls_attr]: test " << tc.test_id
+-                 << " provides no meaningful input.";
+-  }
+-
+-  // Note that for arrange, we also want to place TED entries before the one
+-  // we actually want to test
+-  for (const TedVar& var : tc.initial_state.ted) {
+-    if (const LinkStateEdge* edge = std::get_if<LinkStateEdge>(&var)) {
+-      ls_attributes* tempAttr;
+-      BApiLinkStateUpdate msg = static_cast<BApiLinkStateUpdate>(*edge);
+-      SendLinkUpdateMessage(msg, tempAttr);
+-      ls_attributes_del(tempAttr);
+-    } else if (const LinkStateSubnet* subnet =
+-                   std::get_if<LinkStateSubnet>(&var)) {
+-      // TODO
+-    }
+-    // ignore other alternatives
+-  }
+-}
+-
+-void LinkStateTest::NodeIdToFrr(const LinkStateNodeId& nodeId,
+-                                ls_node_id& frrNodeId) const {
+-  // for now, we default to IS-IS level 1
+-  frrNodeId = {.origin = ls_origin::ISIS_L1, .id = {.iso = {.level = 1}}};
+-  int ret = SysIdToBuffer(frrNodeId.id.iso.sys_id, nodeId.iso_sys_id.c_str());
+-  ASSERT_EQ(ISIS_SYS_ID_LEN, ret)
+-      << "[sys_id]: node ID is not a valid ISO system identifier.";
+-}
+-
+-void LinkStateTest::AttributesToFrr(const LinkStateAttributes& attr,
+-                                    const ls_node_id& adv,
+-                                    ls_attributes*& frrAttr) const {
+-  in6_addr local{};
+-  int ret = inet_pton(AF_INET6, attr.local.c_str(), (void*)&local);
+-
+-  ASSERT_EQ(1, ret) << "[ipv6]: address is not a valid IPv6 address.";
+-  frrAttr = ls_attributes_new(adv, in_addr{}, local, 0);
+-
+-  in6_addr remote{};
+-  ret = inet_pton(AF_INET6, attr.remote.c_str(), (void*)&remote);
+-  ASSERT_EQ(1, ret) << "[ipv6]: remote address is not a valid IPv6 address.";
+-
+-  frrAttr->standard.remote6 = remote;
+-  SET_FLAG(frrAttr->flags, LS_ATTR_NEIGH_ADDR6);
+-}
+-
+-void LinkStateTest::SendNodeMessage(const ls_node& node, BEvent event) const {
+-  stream* s = stream_new(ZEBRA_MAX_PACKET_SIZ);
+-
+-  // from ls_format_msg (lib/link_state.c, lines 1771, 1794)
+-  stream_putc(s, static_cast<uint8_t>(event));
+-  stream_putc(s, LS_MSG_TYPE_NODE);
+-
+-  // from ls_format_node (lib/link_state.c, lines 1532-1580)
+-  stream_put(s, &node.adv, sizeof(struct ls_node_id));
+-  stream_putw(s, node.flags);
+-
+-  stream_put(s, &node.router_id6, IPV6_MAX_BYTELEN);
+-
+-  bridge_send_message(s, zapi_opaque_registry::LINK_STATE_UPDATE);
+-  stream_free(s);
+-}
+-
+-void LinkStateTest::SendAttributesMessage(const ls_attributes& attr,
+-                                          const ls_node_id& remoteNodeId,
+-                                          BEvent event, bool reverse) const {
+-  stream* s = stream_new(ZEBRA_MAX_PACKET_SIZ);
+-
+-  stream_putc(s, static_cast<uint8_t>(event));
+-  stream_putc(s, LS_MSG_TYPE_ATTRIBUTES);
+-
+-  if (reverse) {
+-    stream_put(s, (void*)&attr.adv, sizeof(ls_node_id));
+-    stream_put(s, (void*)&remoteNodeId, sizeof(ls_node_id));
+-  } else {
+-    stream_put(s, (void*)&remoteNodeId, sizeof(ls_node_id));
+-    stream_put(s, (void*)&attr.adv, sizeof(ls_node_id));
+-  }
+-
+-  stream_putl(s, attr.flags);
+-
+-  if (CHECK_FLAG(attr.flags, LS_ATTR_NAME)) {
+-    size_t len = strlen(attr.name);
+-    stream_putc(s, len + 1);
+-    stream_put(s, (void*)attr.name, len);
+-    stream_putc(s, '\0');
+-  }
+-
+-  if (reverse) {
+-    stream_put(s, (void*)&attr.standard.remote6, IPV6_MAX_BYTELEN);
+-    stream_put(s, (void*)&attr.standard.local6, IPV6_MAX_BYTELEN);
+-  } else {
+-    stream_put(s, (void*)&attr.standard.local6, IPV6_MAX_BYTELEN);
+-    stream_put(s, (void*)&attr.standard.remote6, IPV6_MAX_BYTELEN);
+-  }
+-
+-  bridge_send_message(s, zapi_opaque_registry::LINK_STATE_UPDATE);
+-  stream_free(s);
+-}
+-
+-void LinkStateTest::SendLinkUpdateMessage(const BApiLinkStateUpdate& apiMessage,
+-                                          ls_attributes*& frrAttr) const {
+-  ASSERT_TRUE(std::holds_alternative<LinkStateAttributes>(apiMessage.data))
+-      << "[DataVar]: apiMessage.data is not type LinkStateAttributes.";
+-
+-  const LinkStateAttributes attr =
+-      std::get<LinkStateAttributes>(apiMessage.data);
+-
+-  // TODO model may have IS-IS level as a free variable to test for IS-IS
+-  // interoperability between level 1 and level 2 nodes (specifically 1/2
+-  // nodes); check this again in the future
+-  ls_node_id remote_node_id{};
+-  NodeIdToFrr(apiMessage.remote, remote_node_id);
+-
+-  // TODO same as remote node - see above
+-  ls_node_id adv_node_id{};
+-  NodeIdToFrr(attr.adv, adv_node_id);
+-
+-  AttributesToFrr(attr, adv_node_id, frrAttr);
+-
+-  struct ls_node* remote_node =
+-      ls_node_new(remote_node_id, in_addr{}, frrAttr->standard.remote6);
+-  SendNodeMessage(*remote_node, apiMessage.event);
+-
+-  struct ls_node* adv_node =
+-      ls_node_new(adv_node_id, in_addr{}, frrAttr->standard.local6);
+-  SendNodeMessage(*adv_node, apiMessage.event);
+-
+-  SendAttributesMessage(*frrAttr, remote_node_id, apiMessage.event);  // forward
+-  SendAttributesMessage(*frrAttr, remote_node_id, apiMessage.event,
+-                        true);  // reverse
+-
+-  ls_node_del(adv_node);
+-  ls_node_del(remote_node);
+-}
+-
+-void LinkStateTest::VerifyNlri(const std::vector<Model::RibVar>& rib) const {
+-  for (const Model::RibVar& var : rib) {
+-    if (const BgpLsLinkNlri* entry = std::get_if<BgpLsLinkNlri>(&var)) {
+-      LinkState::LinkNlri nlri = static_cast<LinkState::LinkNlri>(*entry);
+-      LinkState::ParentNlri p{.type = LinkState::NlriType::LINK,
+-                              .data = {.link = nlri}};
+-      // WARNING: unsafe cast; this is being used to bypass include errors with
+-      // the FRR bgpd library
+-      bgp_ls_nlri* nlriCast = reinterpret_cast<bgp_ls_nlri*>(&p);
+-      ASSERT_TRUE(bridge_link_exists_nlri(nlriCast))
+-          << "[bgp_ls_nlri]: NLRI does not exist within the RIB.";
+-    } else if (const BgpLsPrefixNlri* entry =
+-                   std::get_if<BgpLsPrefixNlri>(&var)) {
+-      // TODO
+-    }
+-  }
+-}
+-
+-TEST_P(LinkStateTest, ValidateEdgeUpdate) {
+-  // Arrange
+-  TestCase tc = GetParam();
+-
+-  if (std::holds_alternative<LinkStateAttributes>(tc.api_param.data)) {
+-    ArrangeLinkTest(tc);
+-  } else if (std::holds_alternative<LinkStatePrefix>(tc.api_param.data)) {
+-    // TODO
+-  } else {
+-    FAIL() << "[DataVar]: unknown alternative found in tc.api_param.data.";
+-  }
+-
+-  // Act
+-  ls_attributes* attr;
+-  SendLinkUpdateMessage(tc.api_param, attr);
+-
+-  // Debug
+-  if (LinkStateTest::DebugMode) {
+-    struct sbuf sbuf;
+-    sbuf_init(&sbuf, NULL, 0);
+-
+-    bridge_show_ted(&sbuf);
+-    bridge_show_table(&sbuf);
+-    std::cout << sbuf_buf(&sbuf) << std::endl;
+-    sbuf_free(&sbuf);
+-  }
+-
+-  // Assert
+-  ASSERT_TRUE(bridge_edge_exists_ted(attr))
+-      << "[ls_attributes]: edge does not exist within TED.";
+-  VerifyNlri(tc.final_state.rib);
+-
+-  // Clean
+-  ls_attributes_del(attr);
+-}
+-
+-// supplies a custom ID generator based on the TestId field in JSON
+-INSTANTIATE_TEST_SUITE_P(
+-    CrossHairCoverageTestCases, LinkStateTest, ::testing::ValuesIn(testCases),
+-    [](const ::testing::TestParamInfo<LinkStateTest::ParamType>& info) {
+-      return std::to_string(info.param.test_id);
+-    });
+-
+-}  // namespace Model
+-- 
+2.34.1
+

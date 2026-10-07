@@ -1,0 +1,1320 @@
+From c5b7192636e93b6c9ae04159361c21820d6fdb54 Mon Sep 17 00:00:00 2001
+From: Gabe Lapingcao <mgultra2018@gmail.com>
+Date: Thu, 9 Jul 2026 14:31:08 -0700
+Subject: [PATCH 01/14] [tests/gtest]: set up initial Google Test suite data
+ structures
+
+Introduces the Google Test framework for building a custom test suite
+for verifying BGP-LS functionality within FRR.
+
+- Implements model-generated test data structures for JSON parsing.
+- Configures a development container environment for building and
+  linking statically with FRR in Ubuntu.
+- Configures CMake to work with the containerized environment.
+- Implements a bridge between C/C++ code to circumvent include issues.
+- Initializes bgpd as part of a Google Test environment in preparation
+  for link-state operations.
+
+Signed-off-by: Gabe Lapingcao <mgultra2018@gmail.com>
+---
+ tests/gtest/.clang-format                     | 226 ++++++++++
+ tests/gtest/.devcontainer/compose.yml         |  22 +
+ .../.devcontainer/devcontainer-lock.json      |   9 +
+ tests/gtest/.devcontainer/devcontainer.json   |  15 +
+ tests/gtest/.gitignore                        |  19 +
+ tests/gtest/.vscode/extensions.json           |   8 +
+ tests/gtest/.vscode/settings.json             |   7 +
+ tests/gtest/CMakeLists.txt                    |  90 ++++
+ tests/gtest/CMakePresets.json                 |  59 +++
+ tests/gtest/README.md                         |   3 +
+ tests/gtest/include/bgpd_env.h                |  36 ++
+ tests/gtest/include/common_data.h             | 192 +++++++++
+ tests/gtest/include/frr_bridge.h              |  22 +
+ tests/gtest/src/bgpd_env.cpp                  |  17 +
+ tests/gtest/src/frr_bridge.c                  | 397 ++++++++++++++++++
+ tests/gtest/src/main.cpp                      |  13 +
+ tests/gtest/src/test_bgp_ls_edge_update.cpp   |  21 +
+ 17 files changed, 1156 insertions(+)
+ create mode 100644 tests/gtest/.clang-format
+ create mode 100644 tests/gtest/.devcontainer/compose.yml
+ create mode 100644 tests/gtest/.devcontainer/devcontainer-lock.json
+ create mode 100644 tests/gtest/.devcontainer/devcontainer.json
+ create mode 100644 tests/gtest/.gitignore
+ create mode 100644 tests/gtest/.vscode/extensions.json
+ create mode 100644 tests/gtest/.vscode/settings.json
+ create mode 100644 tests/gtest/CMakeLists.txt
+ create mode 100644 tests/gtest/CMakePresets.json
+ create mode 100644 tests/gtest/README.md
+ create mode 100644 tests/gtest/include/bgpd_env.h
+ create mode 100644 tests/gtest/include/common_data.h
+ create mode 100644 tests/gtest/include/frr_bridge.h
+ create mode 100644 tests/gtest/src/bgpd_env.cpp
+ create mode 100644 tests/gtest/src/frr_bridge.c
+ create mode 100644 tests/gtest/src/main.cpp
+ create mode 100644 tests/gtest/src/test_bgp_ls_edge_update.cpp
+
+diff --git a/tests/gtest/.clang-format b/tests/gtest/.clang-format
+new file mode 100644
+index 0000000000..b1392af5d1
+--- /dev/null
++++ b/tests/gtest/.clang-format
+@@ -0,0 +1,226 @@
++---
++Language:        Cpp
++# BasedOnStyle:  Google
++AccessModifierOffset: -1
++AlignAfterOpenBracket: Align
++AlignArrayOfStructures: None
++AlignConsecutiveMacros: None
++AlignConsecutiveAssignments: None
++AlignConsecutiveBitFields: None
++AlignConsecutiveDeclarations: None
++AlignEscapedNewlines: Left
++AlignOperands:   Align
++AlignTrailingComments: true
++AllowAllArgumentsOnNextLine: true
++AllowAllParametersOfDeclarationOnNextLine: true
++AllowShortEnumsOnASingleLine: true
++AllowShortBlocksOnASingleLine: Never
++AllowShortCaseLabelsOnASingleLine: false
++AllowShortFunctionsOnASingleLine: All
++AllowShortLambdasOnASingleLine: All
++AllowShortIfStatementsOnASingleLine: WithoutElse
++AllowShortLoopsOnASingleLine: true
++AlwaysBreakAfterDefinitionReturnType: None
++AlwaysBreakAfterReturnType: None
++AlwaysBreakBeforeMultilineStrings: true
++AlwaysBreakTemplateDeclarations: Yes
++AttributeMacros:
++  - __capability
++BinPackArguments: true
++BinPackParameters: true
++BraceWrapping:
++  AfterCaseLabel:  false
++  AfterClass:      false
++  AfterControlStatement: Never
++  AfterEnum:       false
++  AfterFunction:   false
++  AfterNamespace:  false
++  AfterObjCDeclaration: false
++  AfterStruct:     false
++  AfterUnion:      false
++  AfterExternBlock: false
++  BeforeCatch:     false
++  BeforeElse:      false
++  BeforeLambdaBody: false
++  BeforeWhile:     false
++  IndentBraces:    false
++  SplitEmptyFunction: true
++  SplitEmptyRecord: true
++  SplitEmptyNamespace: true
++BreakBeforeBinaryOperators: None
++BreakBeforeConceptDeclarations: true
++BreakBeforeBraces: Attach
++BreakBeforeInheritanceComma: false
++BreakInheritanceList: BeforeColon
++BreakBeforeTernaryOperators: true
++BreakConstructorInitializersBeforeComma: false
++BreakConstructorInitializers: BeforeColon
++BreakAfterJavaFieldAnnotations: false
++BreakStringLiterals: true
++ColumnLimit:     80
++CommentPragmas:  '^ IWYU pragma:'
++QualifierAlignment: Leave
++CompactNamespaces: false
++ConstructorInitializerIndentWidth: 4
++ContinuationIndentWidth: 4
++Cpp11BracedListStyle: true
++DeriveLineEnding: true
++DerivePointerAlignment: true
++DisableFormat:   false
++EmptyLineAfterAccessModifier: Never
++EmptyLineBeforeAccessModifier: LogicalBlock
++ExperimentalAutoDetectBinPacking: false
++PackConstructorInitializers: NextLine
++BasedOnStyle:    ''
++ConstructorInitializerAllOnOneLineOrOnePerLine: false
++AllowAllConstructorInitializersOnNextLine: true
++FixNamespaceComments: true
++ForEachMacros:
++  - foreach
++  - Q_FOREACH
++  - BOOST_FOREACH
++IfMacros:
++  - KJ_IF_MAYBE
++IncludeBlocks:   Regroup
++IncludeCategories:
++  - Regex:           '^<ext/.*\.h>'
++    Priority:        2
++    SortPriority:    0
++    CaseSensitive:   false
++  - Regex:           '^<.*\.h>'
++    Priority:        1
++    SortPriority:    0
++    CaseSensitive:   false
++  - Regex:           '^<.*'
++    Priority:        2
++    SortPriority:    0
++    CaseSensitive:   false
++  - Regex:           '.*'
++    Priority:        3
++    SortPriority:    0
++    CaseSensitive:   false
++IncludeIsMainRegex: '([-_](test|unittest))?$'
++IncludeIsMainSourceRegex: ''
++IndentAccessModifiers: false
++IndentCaseLabels: true
++IndentCaseBlocks: false
++IndentGotoLabels: true
++IndentPPDirectives: None
++IndentExternBlock: AfterExternBlock
++IndentRequires:  false
++IndentWidth:     2
++IndentWrappedFunctionNames: false
++InsertTrailingCommas: None
++JavaScriptQuotes: Leave
++JavaScriptWrapImports: true
++KeepEmptyLinesAtTheStartOfBlocks: false
++LambdaBodyIndentation: Signature
++MacroBlockBegin: ''
++MacroBlockEnd:   ''
++MaxEmptyLinesToKeep: 1
++NamespaceIndentation: None
++ObjCBinPackProtocolList: Never
++ObjCBlockIndentWidth: 2
++ObjCBreakBeforeNestedBlockParam: true
++ObjCSpaceAfterProperty: false
++ObjCSpaceBeforeProtocolList: true
++PenaltyBreakAssignment: 2
++PenaltyBreakBeforeFirstCallParameter: 1
++PenaltyBreakComment: 300
++PenaltyBreakFirstLessLess: 120
++PenaltyBreakOpenParenthesis: 0
++PenaltyBreakString: 1000
++PenaltyBreakTemplateDeclaration: 10
++PenaltyExcessCharacter: 1000000
++PenaltyReturnTypeOnItsOwnLine: 200
++PenaltyIndentedWhitespace: 0
++PointerAlignment: Left
++PPIndentWidth:   -1
++RawStringFormats:
++  - Language:        Cpp
++    Delimiters:
++      - cc
++      - CC
++      - cpp
++      - Cpp
++      - CPP
++      - 'c++'
++      - 'C++'
++    CanonicalDelimiter: ''
++    BasedOnStyle:    google
++  - Language:        TextProto
++    Delimiters:
++      - pb
++      - PB
++      - proto
++      - PROTO
++    EnclosingFunctions:
++      - EqualsProto
++      - EquivToProto
++      - PARSE_PARTIAL_TEXT_PROTO
++      - PARSE_TEST_PROTO
++      - PARSE_TEXT_PROTO
++      - ParseTextOrDie
++      - ParseTextProtoOrDie
++      - ParseTestProto
++      - ParsePartialTestProto
++    CanonicalDelimiter: pb
++    BasedOnStyle:    google
++ReferenceAlignment: Pointer
++ReflowComments:  true
++RemoveBracesLLVM: false
++SeparateDefinitionBlocks: Leave
++ShortNamespaceLines: 1
++SortIncludes:    CaseSensitive
++SortJavaStaticImport: Before
++SortUsingDeclarations: true
++SpaceAfterCStyleCast: false
++SpaceAfterLogicalNot: false
++SpaceAfterTemplateKeyword: true
++SpaceBeforeAssignmentOperators: true
++SpaceBeforeCaseColon: false
++SpaceBeforeCpp11BracedList: false
++SpaceBeforeCtorInitializerColon: true
++SpaceBeforeInheritanceColon: true
++SpaceBeforeParens: ControlStatements
++SpaceBeforeParensOptions:
++  AfterControlStatements: true
++  AfterForeachMacros: true
++  AfterFunctionDefinitionName: false
++  AfterFunctionDeclarationName: false
++  AfterIfMacros:   true
++  AfterOverloadedOperator: false
++  BeforeNonEmptyParentheses: false
++SpaceAroundPointerQualifiers: Default
++SpaceBeforeRangeBasedForLoopColon: true
++SpaceInEmptyBlock: false
++SpaceInEmptyParentheses: false
++SpacesBeforeTrailingComments: 2
++SpacesInAngles:  Never
++SpacesInConditionalStatement: false
++SpacesInContainerLiterals: true
++SpacesInCStyleCastParentheses: false
++SpacesInLineCommentPrefix:
++  Minimum:         1
++  Maximum:         -1
++SpacesInParentheses: false
++SpacesInSquareBrackets: false
++SpaceBeforeSquareBrackets: false
++BitFieldColonSpacing: Both
++Standard:        Auto
++StatementAttributeLikeMacros:
++  - Q_EMIT
++StatementMacros:
++  - Q_UNUSED
++  - QT_REQUIRE_VERSION
++TabWidth:        8
++UseCRLF:         false
++UseTab:          Never
++WhitespaceSensitiveMacros:
++  - STRINGIZE
++  - PP_STRINGIZE
++  - BOOST_PP_STRINGIZE
++  - NS_SWIFT_NAME
++  - CF_SWIFT_NAME
++...
++
+diff --git a/tests/gtest/.devcontainer/compose.yml b/tests/gtest/.devcontainer/compose.yml
+new file mode 100644
+index 0000000000..1c13763842
+--- /dev/null
++++ b/tests/gtest/.devcontainer/compose.yml
+@@ -0,0 +1,22 @@
++services:
++  gtest-dev:
++    image: frr-ubuntu22:latest
++    
++    build:
++      context: ../../..
++      dockerfile: docker/ubuntu-ci/Dockerfile
++    
++    volumes:
++      - ..:/gtest
++    
++    # enable ptrace-based debugger
++    cap_add:
++      - SYS_PTRACE
++    security_opt:
++      - seccomp:unconfined
++    ports:
++      - "1234:1234"
++      - "8888:8888"
++
++    # overrides default command so things don't shut down after process ends
++    command: sleep infinity
+diff --git a/tests/gtest/.devcontainer/devcontainer-lock.json b/tests/gtest/.devcontainer/devcontainer-lock.json
+new file mode 100644
+index 0000000000..08fdf1c25b
+--- /dev/null
++++ b/tests/gtest/.devcontainer/devcontainer-lock.json
+@@ -0,0 +1,9 @@
++{
++  "features": {
++    "ghcr.io/devcontainers-extra/features/cmake:1": {
++      "version": "1.0.0",
++      "resolved": "ghcr.io/devcontainers-extra/features/cmake@sha256:86e25502f6b1213a68d88e4e55c969eba0b5016b9666d216ab65f5047808bc90",
++      "integrity": "sha256:86e25502f6b1213a68d88e4e55c969eba0b5016b9666d216ab65f5047808bc90"
++    }
++  }
++}
+diff --git a/tests/gtest/.devcontainer/devcontainer.json b/tests/gtest/.devcontainer/devcontainer.json
+new file mode 100644
+index 0000000000..3512875a18
+--- /dev/null
++++ b/tests/gtest/.devcontainer/devcontainer.json
+@@ -0,0 +1,15 @@
++{
++    "name": "FRR bgpd Google Test Environment",
++    "dockerComposeFile": "compose.yml",
++    "service": "gtest-dev",
++    "workspaceFolder": "/gtest",
++    "shutdownAction": "stopCompose",
++    "remoteUser": "frr",
++    "updateRemoteUserUID": true,
++    "features": {
++        "ghcr.io/devcontainers-extra/features/cmake:1": {
++            "version": "latest"
++        }
++    },
++    "postCreateCommand": "sudo apt-get update && sudo apt-get install -y clang llvm lld lldb ninja-build"
++}
+\ No newline at end of file
+diff --git a/tests/gtest/.gitignore b/tests/gtest/.gitignore
+new file mode 100644
+index 0000000000..bf48c2aca6
+--- /dev/null
++++ b/tests/gtest/.gitignore
+@@ -0,0 +1,19 @@
++# --- Build Artifacts ---
++.cache/
++build/
++bin/
++lib/
++out/
++*.so
++*.o
++*.a
++compile_commands.json
++
++# --- IDEs ---
++.vs/
++!.vscode/
++*.swp
++*.suo
++.idea/
++.DS_Store
++Thumbs.db
+diff --git a/tests/gtest/.vscode/extensions.json b/tests/gtest/.vscode/extensions.json
+new file mode 100644
+index 0000000000..c2cd4d53cd
+--- /dev/null
++++ b/tests/gtest/.vscode/extensions.json
+@@ -0,0 +1,8 @@
++{
++    "recommendations": [
++        "ms-vscode.cpptools",
++        "ms-vscode.cpptools-themes",
++        "ms-vscode.cmake-tools",
++        "vadimcn.vscode-lldb",
++    ]
++}
+\ No newline at end of file
+diff --git a/tests/gtest/.vscode/settings.json b/tests/gtest/.vscode/settings.json
+new file mode 100644
+index 0000000000..972833cfcd
+--- /dev/null
++++ b/tests/gtest/.vscode/settings.json
+@@ -0,0 +1,7 @@
++{
++    "C_Cpp.default.configurationProvider": "ms-vscode.cmake-tools",
++    "cmake.debugConfig": {
++        "type": "lldb"
++    },
++    "files.eol": "\n"
++}
+\ No newline at end of file
+diff --git a/tests/gtest/CMakeLists.txt b/tests/gtest/CMakeLists.txt
+new file mode 100644
+index 0000000000..bd6933f253
+--- /dev/null
++++ b/tests/gtest/CMakeLists.txt
+@@ -0,0 +1,90 @@
++cmake_minimum_required(VERSION 3.23)
++
++project(FrrBgpdTests LANGUAGES CXX C)
++
++set(CMAKE_CXX_STANDARD 23)              # Google Test recommends latest C++ version
++set(CMAKE_CXX_STANDARD_REQUIRED ON)
++set(CMAKE_C_STANDARD 11)                # FRR uses C11 for compilation
++set(CMAKE_C_STANDARD_REQUIRED ON)
++set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
++set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/bin/${CMAKE_BUILD_TYPE}")
++set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/bin/${CMAKE_BUILD_TYPE}")
++set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/bin/${CMAKE_BUILD_TYPE}")
++
++include(FetchContent)
++
++# Google Test
++FetchContent_Declare(
++    googletest
++    GIT_REPOSITORY  https://github.com/google/googletest.git
++    GIT_TAG         52eb8108c5bdec04579160ae17225d66034bd723 # release-1.17.0
++    GIT_SHALLOW     TRUE
++    GIT_PROGRESS    TRUE
++)
++FetchContent_MakeAvailable(googletest)
++
++# nlohmann JSON
++FetchContent_Declare(
++    json
++    GIT_REPOSITORY  https://github.com/nlohmann/json.git
++    GIT_TAG         55f93686c01528224f448c19128836e7df245f72 # release-3.12.0
++    GIT_SHALLOW     TRUE
++    GIT_PROGRESS    TRUE
++)
++FetchContent_MakeAvailable(json)
++
++# libfrr.a, libbgp.a, and librfp.a grouped (rather not deal with dependency ordering) 
++find_library(LIBFRR
++    NAMES libfrr.a
++    HINTS /lib
++    REQUIRED
++)
++find_library(LIBBGP
++    NAMES libbgp.a
++    HINTS /home/frr/frr/bgpd
++    REQUIRED
++)
++find_library(LIBRFP
++    NAMES librfp.a
++    HINTS /home/frr/frr/bgpd/rfp-example/librfp
++    REQUIRED
++)
++
++add_executable(model_tests 
++    "src/bgpd_env.cpp"
++    "src/main.cpp" 
++    "src/test_bgp_ls_edge_update.cpp" 
++
++    "src/frr_bridge.c"
++)
++
++set_target_properties(model_tests PROPERTIES POSITION_INDEPENDENT_CODE OFF)
++
++target_link_libraries(model_tests
++    PRIVATE
++        GTest::gtest_main
++        nlohmann_json::nlohmann_json
++
++        -Wl,--start-group               # in a group to resolve potential circular dependencies
++        ${LIBFRR}
++        ${LIBBGP}
++        ${LIBRFP}
++        -Wl,--end-group
++
++        json-c
++        sqlite3
++        yang
++        cap
++        crypt
++        m
++        gcov
++        lua5.3
++)
++target_include_directories(model_tests
++    PUBLIC
++        "${CMAKE_SOURCE_DIR}/include"
++        "/home/frr/frr"
++        "/home/frr/frr/lib"
++)
++
++target_compile_options(model_tests PRIVATE -DHAVE_CONFIG_H)
+diff --git a/tests/gtest/CMakePresets.json b/tests/gtest/CMakePresets.json
+new file mode 100644
+index 0000000000..29b3511020
+--- /dev/null
++++ b/tests/gtest/CMakePresets.json
+@@ -0,0 +1,59 @@
++{
++    "version": 4,
++    "cmakeMinimumRequired": {
++        "major": 3,
++        "minor": 23,
++        "patch": 0
++    },
++    "configurePresets": [
++        {
++            "name": "base",
++            "hidden": true,
++            "binaryDir": "${sourceDir}/bin/build/${presetName}",
++            "installDir": "${sourceDir}/bin/install/${presetName}",
++            "generator": "Ninja",
++            "cacheVariables": {
++                "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
++                "CMAKE_C_COMPILER": "clang",
++                "CMAKE_CXX_COMPILER": "clang++",
++                "CMAKE_BUILD_TYPE": "Debug"
++            }
++        },
++        {
++            "name": "linux-x64-debug",
++            "displayName": "Linux x64 Debug",
++            "inherits": "base",
++            "condition": {
++                "type": "equals",
++                "lhs": "${hostSystemName}",
++                "rhs": "Linux"
++            }
++        },
++        {
++            "name": "Custom configure preset",
++            "displayName": "Custom configure preset",
++            "description": "Sets Ninja generator, build and install directory",
++            "generator": "Ninja",
++            "binaryDir": "${sourceDir}/out/build/${presetName}",
++            "cacheVariables": {
++                "CMAKE_BUILD_TYPE": "Debug",
++                "CMAKE_INSTALL_PREFIX": "${sourceDir}/out/install/${presetName}"
++            }
++        }
++    ],
++    "buildPresets": [
++        {
++            "name": "linux-x64-debug",
++            "configurePreset": "linux-x64-debug"
++        }
++    ],
++    "testPresets": [
++        {
++            "name": "linux-x64-debug",
++            "configurePreset": "linux-x64-debug",
++            "output": {
++                "outputOnFailure": true
++            }
++        }
++    ]
++}
+\ No newline at end of file
+diff --git a/tests/gtest/README.md b/tests/gtest/README.md
+new file mode 100644
+index 0000000000..a27acfd101
+--- /dev/null
++++ b/tests/gtest/README.md
+@@ -0,0 +1,3 @@
++# FRR bgpd Google Test Cases
++
++Development of high-coverage implementation of CrossHair-generated edge update tests for BGP-LS using the Google Test framework.
+diff --git a/tests/gtest/include/bgpd_env.h b/tests/gtest/include/bgpd_env.h
+new file mode 100644
+index 0000000000..a768ce5f63
+--- /dev/null
++++ b/tests/gtest/include/bgpd_env.h
+@@ -0,0 +1,36 @@
++#ifndef BGP_ENV_H
++#define BGP_ENV_H
++
++#include <gtest/gtest.h>
++
++namespace Model {
++class BgpdEnvironment : public ::testing::Environment {
++ public:
++  /**
++   * @brief Initializes FRR's BGP daemon, bgpd, in a static section of memory.
++   *
++   * Most of the work is done inside `bridge_init_bgp()` within
++   * frr_bridge.h. The constructor simply acts as a C++ wrapper around the
++   * bridge's C implementation.
++   */
++  BgpdEnvironment();
++
++  /**
++   * @brief Cleans FRR's BGP daemon, bgpd, by freeing any associated blocks.
++   *
++   * Similar to the constructor, most of the work is done inside
++   * `bridge_clean_bgp()` within frr_bridge.h. Note that because most of
++   * the memory allocated for bgpd is kept in static memory, not all blocks are
++   * freed by this destructor. This is because pointers to dynamically allocated
++   * blocks will be kept even during OS cleanup of the process.
++   */
++  virtual ~BgpdEnvironment() override;
++
++  /**
++   * @brief Checks that FRR's BGP daemon is actively running.
++   */
++  virtual void SetUp() override;
++};
++}  // namespace Model
++
++#endif  // BGP_ENV_H
+diff --git a/tests/gtest/include/common_data.h b/tests/gtest/include/common_data.h
+new file mode 100644
+index 0000000000..7fff76acfe
+--- /dev/null
++++ b/tests/gtest/include/common_data.h
+@@ -0,0 +1,192 @@
++#ifndef COMMON_DATA_H
++#define COMMON_DATA_H
++
++#include <cstdint>
++#include <nlohmann/json.hpp>
++#include <string>
++#include <vector>
++
++using sys_id_t = std::string;
++using prefix_t = std::string;
++using addr_t = std::string;
++
++namespace Model {
++
++/**
++ * @brief Link-state node according to the BGP-LS protocol.
++ *
++ * This data structure is a trimmed version of FRR's node descriptor. The
++ * original node descriptor data structure fully complies with RFC 9552.
++ */
++struct BgpLsNode {
++  uint32_t asn;
++  sys_id_t igp_router_id;
++};
++NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(BgpLsNode, asn, igp_router_id)
++
++/**
++ * @brief Link-state link according to the BGP-LS protocol.
++ *
++ * This data structure is a trimmed version of FRR's link descriptor. Most
++ * notably, it only includes IPv6 address fields rather than having IDs and IPv4
++ * addresses alongside it. The original link descriptor data structure fully
++ * complies with RFC 9552.
++ */
++struct BgpLsLink {
++  addr_t interface;
++  addr_t neighbor;
++  uint32_t remote_asn;
++};
++NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(BgpLsLink, interface, neighbor, remote_asn)
++
++/**
++ * @brief Link-state link Network Layer Reachability Information (NLRI).
++ *
++ * This data structure is a trimmed version of FRR's link NLRI. Because this
++ * test suite is limited to IS-IS in scope, specifying `protocol_id` would be
++ * redundant to this implementation. The original link NLRI data structure fully
++ * complies with RFC 9552.
++ */
++struct BgpLsLinkNlri {
++  BgpLsNode source;
++  BgpLsNode destination;
++  BgpLsLink link;
++};
++NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(BgpLsLinkNlri, source, destination, link)
++
++/**
++ * @brief Unique identifier for a node in a network.
++ *
++ * This data structure is a trimmed version of FRR's node ID. Because this test
++ * suite is limited to IS-IS in scope, specifying `origin` would be redundant to
++ * this implementation. The original node ID data structure is specific to FRR's
++ * implementation of an IGP-agnostic link-state representation of the network.
++ */
++struct LinkStateNodeId {
++  sys_id_t iso_sys_id;
++  uint8_t level;
++};
++NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(LinkStateNodeId, iso_sys_id, level)
++
++/**
++ * @brief Unidirectional path between two nodes in a network.
++ *
++ * This data structure is a trimmed version of FRR's edge. Most notably, FRR
++ * uses a red-black tree internally to speed up edge lookups within the TED.
++ * The original edge data structure is specific to FRR's implementation of
++ * an IGP-agnostic link-state representation of the network.
++ */
++struct LinkStateEdge {
++  uint32_t asn;
++  LinkStateNodeId source_node;
++  LinkStateNodeId destination_node;
++  addr_t source;
++  addr_t destination;
++};
++NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(LinkStateEdge, asn, source_node,
++                                   destination_node, source, destination)
++
++/**
++ * @brief Various metrics assigned to or collected from a link between two nodes
++ * in a network.
++ *
++ * This data structure is a trimmed version of FRR's attributes. FRR keeps track
++ * of 60+ fields; this test suite only uses a small subset of those fields for
++ * validation, which includes the source and destination addresses. The original
++ * attributes data structure is specific to FRR's implementation of an
++ * IGP-agnostic link-state representation of the network.
++ */
++struct LinkStateAttributes {
++  bool valid;
++  LinkStateNodeId adv;
++  std::string name;
++  uint32_t metric;
++  addr_t local;
++  addr_t remote;
++};
++NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(LinkStateAttributes, valid, adv, name,
++                                   metric, local, remote)
++
++/**
++ * @brief Link-state message event.
++ *
++ * This enum class corresponds directly to the Zebra API's Opaque link-state
++ * message event macros. Currently, only five types, `UNDEF`, `SYNC`, `ADD`,
++ * `UPDATE`, and `DELETE`, are implemented.
++ */
++enum class BEvent : uint8_t { UNDEF = 0, SYNC, ADD, UPDATE, DELETE };
++
++/**
++ * @brief Link-state update message.
++ *
++ * This data structure is a trimmed version of FRR's message. Because this test
++ * suite is limited to edge updates, specifying `type` would be redundant to
++ * this implementation. The original message data structure is specific the
++ * Zebra API's Opaque message system.
++ */
++struct BApiLinkStateUpdate {
++  BEvent event;
++  LinkStateNodeId remote;
++  LinkStateAttributes data;
++};
++NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(BApiLinkStateUpdate, event, remote, data)
++
++/**
++ * @brief Link-state of the BGP instance.
++ *
++ * This data structure encapsulates both BGP's Routing Information Base (RIB)
++ * and BGP-LS's internal Traffic Engineering Database (TED); FRR's
++ * implementation does not keep this information together in one place. However,
++ * the BGP instance should be keeping both the RIB and the TED synced.
++ */
++struct BgpLsLinkState {
++  uint32_t asn;
++  std::vector<LinkStateEdge> ted;
++  std::vector<BgpLsLinkNlri> rib;
++};
++inline void to_json(nlohmann::json& j, const BgpLsLinkState& ls) {
++  j = nlohmann::json{
++      {"asn", ls.asn}, {"linkstate_ted", ls.ted}, {"rib_nlri", ls.rib}};
++}
++inline void from_json(const nlohmann::json& j, BgpLsLinkState& ls) {
++  j.at("asn").get_to(ls.asn);
++  j.at("linkstate_ted").get_to(ls.ted);
++  j.at("rib_nlri").get_to(ls.rib);
++}
++
++/**
++ * @brief Model test case containing initial state, transition, and final state.
++ */
++struct TestCase {
++  int test_id;
++  std::string op;  // currently always "api_bgp_ls_edge_update"
++  BgpLsLinkState initial_state;
++  BApiLinkStateUpdate api_param;
++  BgpLsLinkState final_state;
++  int response;
++};
++inline void to_json(nlohmann::json& j, const TestCase& tc) {
++  j = nlohmann::json{{"TestId", tc.test_id},
++                     {"Op", tc.op},
++                     {"InitialState", tc.initial_state},
++                     {"ApiParam", tc.api_param},
++                     {"FinalState", tc.final_state},
++                     {"Response", tc.response}};
++}
++inline void from_json(const nlohmann::json& j, TestCase& tc) {
++  j.at("TestId").get_to(tc.test_id);
++  j.at("Op").get_to(tc.op);
++  j.at("InitialState").get_to(tc.initial_state);
++  j.at("ApiParam").get_to(tc.api_param);
++  j.at("FinalState").get_to(tc.final_state);
++  j.at("Response").get_to(tc.response);
++}
++
++/**
++ * @brief `TestCase` objects used in the Google Test value-parameterized tests.
++ */
++inline std::vector<TestCase> testCases;
++
++}  // namespace Model
++
++#endif  // COMMON_DATA_H
+diff --git a/tests/gtest/include/frr_bridge.h b/tests/gtest/include/frr_bridge.h
+new file mode 100644
+index 0000000000..cd6f7c0989
+--- /dev/null
++++ b/tests/gtest/include/frr_bridge.h
+@@ -0,0 +1,22 @@
++#ifndef FRR_BRIDGE_H
++#define FRR_BRIDGE_H
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/**
++ * @brief Initializes FRR's BGP daemon along with a single BGP routing instance.
++ */
++void bridge_init_bgp(void);
++
++/**
++ * @brief Cleans the running BGP daemon along with any BGP routing instances.
++ */
++void bridge_clean_bgp(void);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif  // FRR_BRIDGE_H
+diff --git a/tests/gtest/src/bgpd_env.cpp b/tests/gtest/src/bgpd_env.cpp
+new file mode 100644
+index 0000000000..a7e0a4a881
+--- /dev/null
++++ b/tests/gtest/src/bgpd_env.cpp
+@@ -0,0 +1,17 @@
++#include "bgpd_env.h"
++
++extern "C" {
++#include "frr_bridge.h"
++}
++
++namespace Model {
++
++BgpdEnvironment::BgpdEnvironment() { bridge_init_bgp(); }
++
++BgpdEnvironment::~BgpdEnvironment() { bridge_clean_bgp(); }
++
++void BgpdEnvironment::SetUp() {
++  // TODO
++}
++
++}  // namespace Model
+diff --git a/tests/gtest/src/frr_bridge.c b/tests/gtest/src/frr_bridge.c
+new file mode 100644
+index 0000000000..03fe2d9ea8
+--- /dev/null
++++ b/tests/gtest/src/frr_bridge.c
+@@ -0,0 +1,397 @@
++#include "frr_bridge.h"
++
++// clang-format off
++#include <zebra.h>
++
++#include <pthread.h>
++#include "vector.h"
++#include "command.h"
++#include "getopt.h"
++#include "frrevent.h"
++#include <lib/version.h>
++#include "memory.h"
++#include "prefix.h"
++#include "log.h"
++#include "privs.h"
++#include "sigevent.h"
++#include "zclient.h"
++#include "routemap.h"
++#include "filter.h"
++#include "plist.h"
++#include "stream.h"
++#include "queue.h"
++#include "vrf.h"
++#include "bfd.h"
++#include "libfrr.h"
++#include "ns.h"
++#include "libagentx.h"
++#include <string.h>
++#include <sys/stat.h>
++
++#include "bgpd/bgpd.h"
++#include "bgpd/bgp_attr.h"
++#include "bgpd/bgp_route.h"
++#include "bgpd/bgp_mplsvpn.h"
++#include "bgpd/bgp_aspath.h"
++#include "bgpd/bgp_dump.h"
++#include "bgpd/bgp_route.h"
++#include "bgpd/bgp_nexthop.h"
++#include "bgpd/bgp_regex.h"
++#include "bgpd/bgp_clist.h"
++#include "bgpd/bgp_debug.h"
++#include "bgpd/bgp_errors.h"
++#include "bgpd/bgp_filter.h"
++#include "bgpd/bgp_zebra.h"
++#include "bgpd/bgp_packet.h"
++#include "bgpd/bgp_keepalives.h"
++#include "bgpd/bgp_network.h"
++#include "bgpd/bgp_errors.h"
++#include "bgpd/bgp_evpn_mh.h"
++#include "bgpd/bgp_nhg.h"
++#include "bgpd/bgp_routemap_nb.h"
++#include "bgpd/bgp_community_alias.h"
++// clang-format on
++
++DEFINE_HOOK(bgp_hook_config_write_vrf, (struct vty * vty, struct vrf *vrf),
++            (vty, vrf));
++
++#ifdef ENABLE_BGP_VNC
++#include "bgpd/rfapi/rfapi_backend.h"
++#endif
++
++DEFINE_HOOK(bgp_hook_vrf_update, (struct vrf * vrf, bool enabled),
++            (vrf, enabled));
++
++void sighup(void);
++void sigint(void);
++void sigusr1(void);
++
++static void bgp_exit(int);
++static void bgp_vrf_terminate(void);
++
++static struct frr_signal_t bgp_signals[] = {
++    {
++        .signal = SIGHUP,
++        .handler = &sighup,
++    },
++    {
++        .signal = SIGUSR1,
++        .handler = &sigusr1,
++    },
++    {
++        .signal = SIGINT,
++        .handler = &sigint,
++    },
++    {
++        .signal = SIGTERM,
++        .handler = &sigint,
++    },
++};
++
++// mimics skip runas CLI option
++struct zebra_privs_t bgpd_privs = {0};
++
++static struct frr_daemon_info bgpd_di;
++
++void sighup(void) { zlog_info("SIGHUP received, ignoring"); }
++
++FRR_NORETURN void sigint(void) {
++  zlog_notice("Terminating on signal");
++  assert(bm->terminating == false);
++  bm->terminating = true;
++
++  bfd_protocol_integration_set_shutdown(true);
++
++  bgp_terminate();
++
++  bgp_exit(0);
++
++  peer_connection_fifo_fini(&bm->connection_fifo);
++  event_cancel(&bm->e_process_packet);
++  pthread_mutex_destroy(&bm->peer_connection_mtx);
++
++  exit(0);
++}
++
++void sigusr1(void) { zlog_rotate(); }
++
++static void bgp_exit(int status) {
++  struct bgp *bgp, *bgp_default, *bgp_evpn;
++  struct listnode *node, *nnode;
++
++  assert(status == 0);
++
++  frr_early_fini();
++
++  bgp_close();
++
++  bgp_default = bgp_get_default();
++  bgp_evpn = bgp_get_evpn();
++
++  bgp_lp_release_pending_lu_locks();
++
++  /* reverse bgp_master_init */
++  for (ALL_LIST_ELEMENTS(bm->bgp, node, nnode, bgp)) {
++    if (bgp_default == bgp || bgp_evpn == bgp) continue;
++    bgp_delete(bgp);
++  }
++  if (bgp_evpn && bgp_evpn != bgp_default) bgp_delete(bgp_evpn);
++  if (bgp_default) bgp_delete(bgp_default);
++
++  bgp_evpn_mh_finish();
++  bgp_nhg_finish();
++
++  zebra_announce_fini(&bm->zebra_announce_head);
++  zebra_announce_fini(&bm->zebra_announce_early_head);
++  zebra_l2_vni_fini(&bm->zebra_l2_vni_head);
++
++  /* reverse bgp_dump_init */
++  bgp_dump_finish();
++
++  /* BGP community aliases */
++  bgp_community_alias_finish();
++
++  /* reverse bgp_route_init */
++  bgp_route_finish();
++
++  /* cleanup route maps */
++  bgp_route_map_terminate();
++
++  /* reverse bgp_attr_init */
++  bgp_attr_finish();
++
++  /* reverse bgp_labels_init */
++  bgp_labels_finish();
++
++  /* stop pthreads */
++  bgp_pthreads_finish();
++
++  /* reverse access_list_init */
++  access_list_add_hook(NULL);
++  access_list_delete_hook(NULL);
++  access_list_reset();
++
++  /* reverse bgp_filter_init */
++  as_list_add_hook(NULL);
++  as_list_delete_hook(NULL);
++  bgp_filter_reset();
++
++  /* reverse prefix_list_init */
++  prefix_list_add_hook(NULL);
++  prefix_list_delete_hook(NULL);
++  prefix_list_reset();
++
++  /* reverse community_list_init */
++  community_list_terminate(bgp_clist);
++
++  bgp_vrf_terminate();
++#ifdef ENABLE_BGP_VNC
++  vnc_zebra_destroy();
++#endif
++  bgp_zebra_destroy();
++
++  bgp_debug_destroy();
++
++  bf_free(bm->rd_idspace);
++  list_delete(&bm->bgp);
++  list_delete(&bm->addresses);
++
++  bgp_lp_finish();
++
++  memset(bm, 0, sizeof(*bm));
++
++  frr_fini();
++}
++
++static int bgp_vrf_new(struct vrf *vrf) {
++  if (BGP_DEBUG(zebra, ZEBRA))
++    zlog_debug("VRF Created: %s(%u)", vrf->name, vrf->vrf_id);
++
++  return 0;
++}
++
++static int bgp_vrf_delete(struct vrf *vrf) {
++  if (BGP_DEBUG(zebra, ZEBRA))
++    zlog_debug("VRF Deletion: %s(%u)", vrf->name, vrf->vrf_id);
++
++  return 0;
++}
++
++static int bgp_vrf_enable(struct vrf *vrf) {
++  struct bgp *bgp;
++  vrf_id_t old_vrf_id;
++  int ret = BGP_GR_FAILURE;
++  (void)ret; /* for unused variable warning */
++
++  if (BGP_DEBUG(zebra, ZEBRA))
++    zlog_debug("VRF enable add %s id %u", vrf->name, vrf->vrf_id);
++
++  bgp = bgp_lookup_by_name(vrf->name);
++  if (bgp && bgp->vrf_id != vrf->vrf_id) {
++    old_vrf_id = bgp->vrf_id;
++    /* We have instance configured, link to VRF and make it "up". */
++    bgp_vrf_link(bgp, vrf);
++
++    VTY_BGP_GR_ROUTER_DETECT_AND_SEND_CAPABILITY_TO_ZEBRA(bgp, bgp->peer, ret);
++
++    bgp_handle_socket(bgp, vrf, old_vrf_id, true);
++    bgp_instance_up(bgp);
++    hook_call(bgp_hook_vrf_update, vrf, true);
++    vpn_leak_zebra_vrf_label_update(bgp, AFI_IP);
++    vpn_leak_zebra_vrf_label_update(bgp, AFI_IP6);
++    vpn_leak_zebra_vrf_sid_update(bgp, AFI_IP);
++    vpn_leak_zebra_vrf_sid_update(bgp, AFI_IP6);
++    vpn_leak_postchange(BGP_VPN_POLICY_DIR_TOVPN, AFI_IP, bgp_get_default(),
++                        bgp);
++    vpn_leak_postchange(BGP_VPN_POLICY_DIR_FROMVPN, AFI_IP, bgp_get_default(),
++                        bgp);
++    vpn_leak_postchange(BGP_VPN_POLICY_DIR_TOVPN, AFI_IP6, bgp_get_default(),
++                        bgp);
++    vpn_leak_postchange(BGP_VPN_POLICY_DIR_FROMVPN, AFI_IP6, bgp_get_default(),
++                        bgp);
++  }
++
++  return 0;
++}
++
++static int bgp_vrf_disable(struct vrf *vrf) {
++  struct bgp *bgp;
++
++  if (vrf->vrf_id == VRF_DEFAULT) return 0;
++
++  if (BGP_DEBUG(zebra, ZEBRA))
++    zlog_debug("VRF disable %s id %d", vrf->name, vrf->vrf_id);
++
++  bgp = bgp_lookup_by_name_filter(vrf->name, false);
++  if (bgp) {
++    vpn_leak_zebra_vrf_label_withdraw(bgp, AFI_IP);
++    vpn_leak_zebra_vrf_label_withdraw(bgp, AFI_IP6);
++    vpn_leak_prechange(BGP_VPN_POLICY_DIR_TOVPN, AFI_IP, bgp_get_default(),
++                       bgp);
++    vpn_leak_prechange(BGP_VPN_POLICY_DIR_FROMVPN, AFI_IP, bgp_get_default(),
++                       bgp);
++    vpn_leak_prechange(BGP_VPN_POLICY_DIR_TOVPN, AFI_IP6, bgp_get_default(),
++                       bgp);
++    vpn_leak_prechange(BGP_VPN_POLICY_DIR_FROMVPN, AFI_IP6, bgp_get_default(),
++                       bgp);
++
++    bgp_handle_socket(bgp, vrf, VRF_UNKNOWN, false);
++    /* We have instance configured, unlink from VRF and make it
++     * "down". */
++    bgp_instance_down(bgp);
++    bgp_vrf_unlink(bgp, vrf);
++    hook_call(bgp_hook_vrf_update, vrf, false);
++  }
++
++  /* Note: This is a callback, the VRF will be deleted by the caller. */
++  return 0;
++}
++
++static int bgp_vrf_config_write(struct vty *vty) {
++  struct vrf *vrf;
++
++  RB_FOREACH(vrf, vrf_name_head, &vrfs_by_name) {
++    if (vrf->vrf_id == VRF_DEFAULT) {
++      vty_out(vty, "!\n");
++      continue;
++    }
++    vty_out(vty, "vrf %s\n", vrf->name);
++
++    hook_call(bgp_hook_config_write_vrf, vty, vrf);
++
++    vty_out(vty, "exit-vrf\n!\n");
++  }
++
++  return 0;
++}
++
++static void bgp_vrf_init(void) {
++  vrf_init(bgp_vrf_new, bgp_vrf_enable, bgp_vrf_disable, bgp_vrf_delete);
++  vrf_cmd_init(bgp_vrf_config_write);
++}
++
++static void bgp_vrf_terminate(void) { vrf_terminate(); }
++
++static const struct frr_yang_module_info *const bgpd_yang_modules[] = {
++    &frr_filter_info, &frr_interface_info,     &frr_route_map_info,
++    &frr_vrf_info,    &frr_bgp_route_map_info,
++};
++
++FRR_DAEMON_INFO(bgpd, BGP, .vty_port = BGP_VTY_PORT,
++                .proghelp = "Implementation of the BGP routing protocol.",
++                .signals = bgp_signals, .n_signals = array_size(bgp_signals),
++                .privs = &bgpd_privs, .yang_modules = bgpd_yang_modules,
++                .n_yang_modules = array_size(bgpd_yang_modules), );
++
++void bridge_init_bgp(void) {
++  const char *test_dir = "/tmp/frr";
++  mkdir(test_dir, 0777);
++
++  strncpy(frr_libstatedir, test_dir, 255);
++  strncpy(frr_runstatedir, test_dir, 255);
++
++  int bgp_port = BGP_PORT_DEFAULT;
++  struct list *addresses = list_new();
++  int instance = 0;
++  int buffer_size = BGP_SOCKET_SNDBUF_SIZE;
++  char *address;
++  struct listnode *node;
++  bool v6_with_v4_nexthops = false;
++
++  addresses->cmp = (int (*)(void *, void *))strcmp;
++
++  int argc = 4;
++  char *argv[] = {"bgpd", "-i", "/tmp/frr_test/bgpd.pid", NULL};
++  frr_preinit(&bgpd_di, argc, argv);
++
++  bgpd_di.limit_fds = 1000;  // mimics setting the --limit-fds option
++
++  // bm is a a global bgp_master struct defined in bgpd/bgpd.h
++  // we initialize it with bgp_master_init
++  bgp_master_init(frr_init(), buffer_size, addresses);
++
++  bm->startup_time = monotime(NULL);
++  bm->port = bgp_port;
++  bm->v6_with_v4_nexthops = v6_with_v4_nexthops;
++
++  bgp_option_set(BGP_OPT_NO_LISTEN);
++  bgp_option_set(BGP_OPT_NO_FIB);
++  bgp_option_set(BGP_OPT_NO_ZEBRA);
++
++  bgp_error_init();
++  libagentx_init();
++  bgp_vrf_init();  // TODO check if this is actually needed (static method in
++                   // source, see bgpd/bgp_main.c)
++
++  bgp_init((unsigned short)instance);
++
++  if (list_isempty(bm->addresses)) {
++    snprintf(bgpd_di.startinfo, sizeof(bgpd_di.startinfo), ", bgp@<all>:%d",
++             bm->port);
++  } else {
++    for (ALL_LIST_ELEMENTS_RO(bm->addresses, node, address))
++      snprintf(bgpd_di.startinfo + strlen(bgpd_di.startinfo),
++               sizeof(bgpd_di.startinfo) - strlen(bgpd_di.startinfo),
++               ", bgp@%s:%d", address, bm->port);
++  }
++
++  bgp_if_init();
++
++  frr_config_fork();
++  bgp_pthreads_run();
++}
++
++void bridge_clean_bgp(void) {
++  assert(bm->terminating == false);
++  bm->terminating = true;
++
++  bfd_protocol_integration_set_shutdown(true);
++
++  bgp_terminate();
++
++  bgp_exit(0);
++
++  peer_connection_fifo_fini(&bm->connection_fifo);
++  event_cancel(&bm->e_process_packet);
++  pthread_mutex_destroy(&bm->peer_connection_mtx);
++}
+diff --git a/tests/gtest/src/main.cpp b/tests/gtest/src/main.cpp
+new file mode 100644
+index 0000000000..55c5f3e335
+--- /dev/null
++++ b/tests/gtest/src/main.cpp
+@@ -0,0 +1,13 @@
++#include <gtest/gtest.h>
++
++#include <fstream>
++
++#include "bgpd_env.h"
++
++int main(int argc, char** argv) {
++  ::testing::InitGoogleTest(&argc, argv);
++
++  ::testing::Environment* const env =
++      ::testing::AddGlobalTestEnvironment(new Model::BgpdEnvironment);
++  return RUN_ALL_TESTS();
++}
+diff --git a/tests/gtest/src/test_bgp_ls_edge_update.cpp b/tests/gtest/src/test_bgp_ls_edge_update.cpp
+new file mode 100644
+index 0000000000..7dc1d29e08
+--- /dev/null
++++ b/tests/gtest/src/test_bgp_ls_edge_update.cpp
+@@ -0,0 +1,21 @@
++#include <gtest/gtest.h>
++
++#include <fstream>
++#include <nlohmann/json.hpp>
++
++#include "common_data.h"
++
++namespace Model {
++
++class EdgeTest : public testing::Test {
++ protected:
++  void SetUp() override {
++    // TODO
++  }
++
++  void TearDown() override {
++    // TODO
++  }
++};
++
++}  // namespace Model
+-- 
+2.34.1
+

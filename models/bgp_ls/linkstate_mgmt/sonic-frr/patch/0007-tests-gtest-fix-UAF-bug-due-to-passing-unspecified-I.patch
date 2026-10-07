@@ -1,0 +1,75 @@
+From 61589dd1aaf5363cdc7179baef6d595e40766444 Mon Sep 17 00:00:00 2001
+From: Gabe Lapingcao <mgultra2018@gmail.com>
+Date: Thu, 23 Jul 2026 13:10:12 -0700
+Subject: [PATCH 07/14] [tests/gtest]: fix UAF bug due to passing unspecified
+ IDs and addresses
+
+Checks each test case's specified local node, remote node, local IP
+address, and remote IP address to ensure each describes a unique
+identifier other than the unspecified address (all zeros).
+
+Signed-off-by: Gabe Lapingcao <mgultra2018@gmail.com>
+---
+ tests/gtest/include/utils.hpp               | 23 +++++++++++++++++++++
+ tests/gtest/src/test_bgp_ls_edge_update.cpp |  4 +++-
+ 2 files changed, 26 insertions(+), 1 deletion(-)
+
+diff --git a/tests/gtest/include/utils.hpp b/tests/gtest/include/utils.hpp
+index 6697617c76..adf6ad728e 100644
+--- a/tests/gtest/include/utils.hpp
++++ b/tests/gtest/include/utils.hpp
+@@ -10,6 +10,7 @@
+ #include <cstring>
+ 
+ static constexpr int ISIS_SYS_ID_LEN = 6;
++static constexpr int ISIS_SYS_ID_CHAR_LEN = 14;
+ 
+ namespace Model {
+ 
+@@ -73,6 +74,28 @@ inline bool IsIpv6Unspecified(const char* ipStr) {
+   return false;
+ }
+ 
++/**
++ * @brief Checks if the string representation of an ISO sys ID is an unspecified
++ * address.
++ */
++inline bool IsSysIdUnspecified(const char* sysId) {
++  if (sysId == nullptr || strlen(sysId) != ISIS_SYS_ID_CHAR_LEN ||
++      sysId[4] != '.' || sysId[9] != '.') {
++    return false;
++  }
++
++  for (int pos = 0; pos < ISIS_SYS_ID_CHAR_LEN; pos++) {
++    if (pos == 4 || pos == 9) {
++      continue;
++    }
++
++    if (sysId[pos] != '0') {
++      return false;
++    }
++  }
++  return true;
++}
++
+ }  // namespace Model
+ 
+ #endif  // UTILS_HPP
+diff --git a/tests/gtest/src/test_bgp_ls_edge_update.cpp b/tests/gtest/src/test_bgp_ls_edge_update.cpp
+index 7788028e85..11ce2d7da7 100644
+--- a/tests/gtest/src/test_bgp_ls_edge_update.cpp
++++ b/tests/gtest/src/test_bgp_ls_edge_update.cpp
+@@ -146,7 +146,9 @@ TEST_P(EdgeTest, ValidateEdgeUpdate) {
+   // Arrange
+   TestCase tc = GetParam();
+ 
+-  if (IsIpv6Unspecified(tc.api_param.data.local.c_str()) ||
++  if (IsSysIdUnspecified(tc.api_param.data.adv.iso_sys_id.c_str()) ||
++      IsSysIdUnspecified(tc.api_param.remote.iso_sys_id.c_str()) ||
++      IsIpv6Unspecified(tc.api_param.data.local.c_str()) ||
+       IsIpv6Unspecified(tc.api_param.data.remote.c_str())) {
+     GTEST_SKIP() << "[ls_attr]: test " << tc.test_id
+                  << " provides no meaningful input.";
+-- 
+2.34.1
+
