@@ -64,28 +64,16 @@ Below is the chronological list of commits included in this patch range:
 
 Ensure you have a local checkout of the FRR repo, Git, Docker, and either the Devcontainer extension  on the host machine.
 
+To avoid errors with compatability, use commit [`bb6bcd66a509de80341e6aa9f8793bf80d0808fc`](https://github.com/KokonutGamer/frr-bgpd-tests/commit/bb6bcd66a509de80341e6aa9f8793bf80d0808fc).
 
 ### Applying Patches using Git
 
-Run these `git` commands within your local FRR repo. It is highly recommended to apply these patches on a separate branch to avoid commits incoming from FRR's remote repo. 
-
-To view a summary of the patch, run the following command.
+Run `git-am` within your local FRR repo. It is highly recommended to apply these patches on a separate branch to avoid commits incoming from FRR's remote repo. This command will notify you if conflicts exist during the patching process. Other files in the project root directory and other subdirectories may cause git to notify a conflict; however, as long as they do not modify the `tests/gtest` subdirectory, these should be safe to ignore.
 ```bash
-cd /path/to/frr
-git apply --stat /path/to/patches/*.patch
+git am /path/to/patches/*.patch
 ```
 
-Before applying the patch, check if the patch is applicable to the current working tree.
-```bash
-git apply --check /path/to/patches/*.patch
-```
-
-Once any local conflicts are resolved, apply the patch series retaining git commit metadata using the command below.
-```bash
-git am < /path/to/patches/*.patch
-```
-
-See the official Git docs on [`git-apply`](https://git-scm.com/docs/git-apply) and [`git-am`](https://git-scm.com/docs/git-am) for more info on these commands.
+See the official Git docs on [`git-am`](https://git-scm.com/docs/git-am) for more info on these commands.
 
 ---
 
